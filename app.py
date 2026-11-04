@@ -1,17 +1,9 @@
-"""
-BB Exhaustion Scanner  -  Streamlit app
-Run:  streamlit run app.py
-
-Strategy (from your Pine script, BB length 22, mult 1.5):
-  BUY signal  : green candle closes back INSIDE lower BB after >=1 red candle closed below lower BB
-  SELL signal : red candle closes back INSIDE upper BB after >=1 green candle closed above upper BB
-  BUY CONFIRMED : a later candle's HIGH crosses the HIGH of the buy-signal candle
-  EXIT          : target = Upper BB touched, OR Sell signal, OR (optional) stop-loss = LOW of signal candle
-Data: Yahoo Finance (yfinance, symbol + ".NS"), fallback NSE via jugaad-data.
-"""
+"""BB Exhaustion Scanner — Streamlit app."""
 import json
 import os
+import tempfile
 from datetime import date, timedelta
+from io import StringIO
 
 import numpy as np
 import pandas as pd
@@ -20,39 +12,18 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(page_title="BB Exhaustion Scanner", page_icon="📈", layout="wide")
-PORTFOLIO_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "portfolio.json")
+ROOT = os.path.dirname(os.path.abspath(__file__))
+PORTFOLIO_FILE = os.path.join(ROOT, "portfolio.json")
+DATA_FILE = os.path.join(ROOT, "data.json")
 
-# ----------------------------------------------------------------------------
-# STOCK UNIVERSE (sorted dictionary). Press "Refresh lists from NSE" in the
-# sidebar to replace these with the latest official constituents.
-# ----------------------------------------------------------------------------
 UNIVERSE = {
-    "Nifty 50": [
-        "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK", "BAJAJ-AUTO", "BAJAJFINSV",
-        "BAJFINANCE", "BEL", "BHARTIARTL", "CIPLA", "COALINDIA", "DRREDDY", "EICHERMOT", "ETERNAL",
-        "GRASIM", "HCLTECH", "HDFCBANK", "HDFCLIFE", "HEROMOTOCO", "HINDALCO", "HINDUNILVR", "ICICIBANK", "INDUSINDBK",
-        "INFY", "ITC", "JIOFIN", "JSWSTEEL", "KOTAKBANK", "LT", "M&M", "MARUTI", "NESTLEIND", "NTPC",
-        "ONGC", "POWERGRID", "RELIANCE", "SBILIFE", "SBIN", "SHRIRAMFIN", "SUNPHARMA", "TATACONSUM",
-        "TATASTEEL", "TCS", "TECHM", "TITAN", "TRENT", "ULTRACEMCO", "WIPRO",
-    ],
-    "Nifty Alpha 50": [
-        "ABCAPITAL", "ADANIPOWER", "AUROPHARMA", "BDL", "BEL", "BHARATFORG", "BSE", "CGPOWER", "COFORGE",
-        "DIXON", "ETERNAL", "GMRAIRPORT", "HAL", "HDFCAMC", "HINDZINC", "INDHOTEL", "INDIGO", "IRFC",
-        "JINDALSTEL", "JSWENERGY", "LAURUSLABS", "LUPIN", "MAZDOCK", "MCX", "MUTHOOTFIN", "NATIONALUM",
-        "NAUKRI", "OFSS", "PERSISTENT", "PFC", "PRESTIGE", "RECLTD", "SOLARINDS", "SRF", "SUZLON",
-        "TATAELXSI", "TORNTPOWER", "TRENT", "TVSMOTOR", "VEDL", "VOLTAS",
-    ],
-    "Midcap High Beta": [
-        "ADANIENT", "ADANIPORTS", "ADANIPOWER", "ASHOKLEY", "BANKBARODA", "BHARATFORG", "BHEL", "CANBK",
-        "DLF", "FEDERALBNK", "GMRAIRPORT", "HINDALCO", "HUDCO", "IDEA", "IDFCFIRSTB", "IREDA", "IRFC",
-        "JINDALSTEL", "JSWSTEEL", "LICHSGFIN", "MOTHERSON", "NATIONALUM", "NBCC", "NMDC", "OIL", "PFC",
-        "PNB", "RECLTD", "RVNL", "SAIL", "SUZLON", "TATAPOWER", "TATASTEEL", "UNIONBANK", "VEDL", "YESBANK",
-    ],
+    "Nifty 50": "ADANIENT ADANIPORTS APOLLOHOSP ASIANPAINT AXISBANK BAJAJ-AUTO BAJAJFINSV BAJFINANCE BEL BHARTIARTL CIPLA COALINDIA DRREDDY EICHERMOT ETERNAL GRASIM HCLTECH HDFCBANK HDFCLIFE HEROMOTOCO HINDALCO HINDUNILVR ICICIBANK INDUSINDBK INFY ITC JIOFIN JSWSTEEL KOTAKBANK LT M&M MARUTI NESTLEIND NTPC ONGC POWERGRID RELIANCE SBILIFE SBIN SHRIRAMFIN SUNPHARMA TATACONSUM TATASTEEL TCS TECHM TITAN TRENT ULTRACEMCO WIPRO",
+    "Nifty Alpha 50": "ABCAPITAL ADANIPOWER AUROPHARMA BDL BEL BHARATFORG BSE CGPOWER COFORGE DIXON ETERNAL GMRAIRPORT HAL HDFCAMC HINDZINC INDHOTEL INDIGO IRFC JINDALSTEL JSWENERGY LAURUSLABS LUPIN MAZDOCK MCX MUTHOOTFIN NATIONALUM NAUKRI OFSS PERSISTENT PFC PRESTIGE RECLTD SOLARINDS SRF SUZLON TATAELXSI TORNTPOWER TRENT TVSMOTOR VEDL VOLTAS",
+    "Midcap High Beta": "ADANIENT ADANIPORTS ADANIPOWER ASHOKLEY BANKBARODA BHARATFORG BHEL CANBK DLF FEDERALBNK GMRAIRPORT HINDALCO HUDCO IDEA IDFCFIRSTB IREDA IRFC JINDALSTEL JSWSTEEL LICHSGFIN MOTHERSON NATIONALUM NBCC NMDC OIL PFC PNB RECLTD RVNL SAIL SUZLON TATAPOWER TATASTEEL UNIONBANK VEDL YESBANK",
 }
-UNIVERSE = {k: sorted(set(v)) for k, v in sorted(UNIVERSE.items())}
-SECTIONS = ["Nifty 50", "Nifty Alpha 50", "Midcap High Beta", "My Portfolio", "Backtest"]
-INDEX_SECTIONS = ["Nifty 50", "Nifty Alpha 50", "Midcap High Beta"]
-
+UNIVERSE = {k: sorted(set(v.split())) for k, v in UNIVERSE.items()}
+INDEXES = list(UNIVERSE)
+SECTIONS = INDEXES + ["My Portfolio", "Backtest"]
 NSE_URLS = {
     "Nifty 50": "https://niftyindices.com/IndexConstituent/ind_nifty50list.csv",
     "Nifty Alpha 50": "https://niftyindices.com/IndexConstituent/ind_niftyalpha50list.csv",
@@ -65,396 +36,438 @@ def get_symbols(name):
 
 
 def refresh_lists():
-    new, failed = {}, []
+    updated, failed = {}, []
     for name, url in NSE_URLS.items():
         try:
-            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-            r.raise_for_status()
-            from io import StringIO
-            syms = pd.read_csv(StringIO(r.text))["Symbol"].dropna().astype(str).str.strip().tolist()
-            new[name] = sorted(set(syms))
+            response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
+            response.raise_for_status()
+            frame = pd.read_csv(StringIO(response.text))
+            if "Symbol" not in frame or frame["Symbol"].dropna().empty:
+                raise ValueError("NSE file has no Symbol values")
+            updated[name] = sorted(set(frame["Symbol"].dropna().astype(str).str.strip()))
         except Exception:
             failed.append(name)
-    st.session_state["lists"] = {**st.session_state.get("lists", {}), **new}
+    st.session_state["lists"] = {**st.session_state.get("lists", {}), **updated}
     return failed
 
 
-# ----------------------------------------------------------------------------
-# DATA
-# ----------------------------------------------------------------------------
-def _clean(df):
-    if df is None or df.empty:
+def clean_prices(frame):
+    """Normalize provider/local OHLC data; reject malformed and duplicate rows."""
+    if frame is None or frame.empty:
         return None
-    df = df[["Open", "High", "Low", "Close"]].dropna()
-    idx = pd.to_datetime(df.index)
-    df.index = (idx.tz_localize(None) if idx.tz is not None else idx).normalize()
-    return df.sort_index() if len(df) else None
-
-
-def _jugaad(symbol, start, interval):
-    from jugaad_data.nse import stock_df  # pip install jugaad-data
-    d = stock_df(symbol=symbol, from_date=start, to_date=date.today(), series="EQ")
-    d = d.rename(columns={"DATE": "Date", "OPEN": "Open", "HIGH": "High", "LOW": "Low", "CLOSE": "Close"})
-    d = d.set_index("Date").sort_index()[["Open", "High", "Low", "Close"]]
-    if interval == "1wk":
-        d.index = pd.to_datetime(d.index)
-        d = d.resample("W").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last"}).dropna()
-    return d
-
-
-DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.json")
-
-
-@st.cache_resource
-def _local_json():
+    if isinstance(frame.columns, pd.MultiIndex):
+        # For a single ticker yfinance may return either level order.
+        for level in range(frame.columns.nlevels):
+            vals = set(map(str, frame.columns.get_level_values(level)))
+            if {"Open", "High", "Low", "Close"}.issubset(vals):
+                frame = frame.copy()
+                frame.columns = frame.columns.get_level_values(level)
+                break
+    required = ["Open", "High", "Low", "Close"]
+    if not set(required).issubset(frame.columns):
+        return None
+    frame = frame.loc[:, required].copy()
+    for col in required:
+        frame[col] = pd.to_numeric(frame[col], errors="coerce")
+    frame = frame.replace([np.inf, -np.inf], np.nan).dropna()
     try:
-        with open(DATA_FILE) as f:
-            return json.load(f)
-    except Exception:
+        idx = pd.to_datetime(frame.index, errors="coerce", utc=True).tz_convert(None).normalize()
+    except (AttributeError, TypeError, ValueError):
+        idx = pd.to_datetime(frame.index, errors="coerce")
+        if getattr(idx, "tz", None) is not None:
+            idx = idx.tz_localize(None)
+        idx = idx.normalize()
+    frame.index = idx
+    frame = frame[~frame.index.isna()].sort_index()
+    frame = frame[~frame.index.duplicated(keep="last")]
+    frame = frame[(frame["High"] >= frame["Low"]) & (frame["Open"] > 0) & (frame["Close"] > 0)]
+    return frame if not frame.empty else None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def local_json():
+    try:
+        with open(DATA_FILE, encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
         return {}
 
 
-def _local_df(symbol, years, interval):
-    """Daily OHLC from data.json (format: {SYMBOL: {d:[dates], o:[], h:[], l:[], c:[]}})."""
-    x = _local_json().get(symbol)
-    if not x:
+def local_prices(symbol, years, interval):
+    record = local_json().get(symbol)
+    if not isinstance(record, dict):
         return None
-    df = pd.DataFrame({"Open": x["o"], "High": x["h"], "Low": x["l"], "Close": x["c"]},
-                      index=pd.to_datetime(x["d"]))
-    df = df[df.index >= pd.Timestamp(date.today() - timedelta(days=int(365 * years)))]
-    if interval == "1wk":
-        df = df.resample("W").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last"}).dropna()
-    return _clean(df)
+    try:
+        daily = pd.DataFrame({"Open": record["o"], "High": record["h"], "Low": record["l"], "Close": record["c"]}, index=pd.to_datetime(record["d"], errors="coerce"))
+        if daily.empty:
+            return None
+        daily = daily[daily.index >= pd.Timestamp(date.today() - timedelta(days=365 * int(years)))]
+        if interval == "1wk":
+            daily = daily.resample("W").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last"}).dropna()
+        return clean_prices(daily)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def nse_fallback(symbol, start, interval):
+    from jugaad_data.nse import stock_df
+    frame = stock_df(symbol=symbol, from_date=start, to_date=date.today(), series="EQ")
+    if frame is None or frame.empty:
+        return None
+    frame = frame.rename(columns={"DATE": "Date", "OPEN": "Open", "HIGH": "High", "LOW": "Low", "CLOSE": "Close"})
+    if "Date" in frame.columns:
+        frame = frame.set_index("Date")
+    frame = clean_prices(frame)
+    if frame is not None and interval == "1wk":
+        frame = clean_prices(frame.resample("W").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last"}).dropna())
+    return frame
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def load_many(symbols, years, interval, source="live"):
-    out = {}
-    if source == "local":  # use data.json first, live only for symbols missing from the file
-        for s in symbols:
-            df = _local_df(s, years, interval)
-            if df is not None and len(df) >= 60:
-                out[s] = df
-        symbols = tuple(s for s in symbols if s not in out)
-        if not symbols:
-            return out
-    start = date.today() - timedelta(days=int(365 * years))
-    tick = [s + ".NS" for s in symbols]
+def load_many(symbols, years, interval, source):
+    symbols = tuple(dict.fromkeys(symbols))
+    results = {}
+    pending = []
+    for symbol in symbols:
+        local = local_prices(symbol, years, interval) if source == "local" else None
+        if local is not None and len(local) >= 30:
+            results[symbol] = local
+        elif source == "live":
+            pending.append(symbol)
+    if not pending:
+        return results
+
+    start = date.today() - timedelta(days=365 * int(years))
+    tickers = [f"{symbol}.NS" for symbol in pending]
     try:
-        raw = yf.download(tick, start=start, interval=interval, group_by="ticker",
-                          auto_adjust=True, progress=False, threads=True)
+        downloaded = yf.download(
+            tickers=tickers, start=start, interval=interval, group_by="ticker",
+            auto_adjust=True, progress=False, threads=True, timeout=20,
+        )
     except Exception:
-        raw = pd.DataFrame()
-    for s, t in zip(symbols, tick):
-        df = None
+        downloaded = pd.DataFrame()
+    for symbol, ticker in zip(pending, tickers):
+        candidate = None
         try:
-            if isinstance(raw.columns, pd.MultiIndex) and t in raw.columns.get_level_values(0):
-                df = _clean(raw[t])
-        except Exception:
-            df = None
-        if df is None or len(df) < 60:  # fallback: NSE directly
+            if not downloaded.empty:
+                if isinstance(downloaded.columns, pd.MultiIndex):
+                    for level in range(downloaded.columns.nlevels):
+                        if ticker in downloaded.columns.get_level_values(level):
+                            candidate = downloaded.xs(ticker, axis=1, level=level)
+                            break
+                elif len(pending) == 1:
+                    candidate = downloaded
+            candidate = clean_prices(candidate)
+        except (KeyError, ValueError, TypeError, AttributeError):
+            candidate = None
+        if candidate is None or len(candidate) < 30:
             try:
-                df = _clean(_jugaad(s, start, interval))
+                candidate = clean_prices(nse_fallback(symbol, start, interval))
             except Exception:
-                pass
-        if df is not None and len(df) >= 60:
-            out[s] = df
-    return out
+                candidate = None
+        if candidate is not None and len(candidate) >= 30:
+            results[symbol] = candidate
+    return results
 
 
-# ----------------------------------------------------------------------------
-# STRATEGY
-# ----------------------------------------------------------------------------
-def add_ind(df, length, mult):
-    d = df.copy()
-    basis = d["Close"].rolling(length).mean()
-    dev = mult * d["Close"].rolling(length).std(ddof=0)  # Pine stdev = population
-    d["basis"], d["upper"], d["lower"] = basis, basis + dev, basis - dev
-    c, o, u, lo = (d[x].values for x in ("Close", "Open", "upper", "lower"))
-    sell = np.zeros(len(d), bool)
-    buy = np.zeros(len(d), bool)
-    g = r = 0
-    for i in range(len(d)):
-        if np.isnan(u[i]):
+def add_indicators(frame, length, multiplier):
+    data = frame.copy()
+    middle = data["Close"].rolling(int(length), min_periods=int(length)).mean()
+    deviation = data["Close"].rolling(int(length), min_periods=int(length)).std(ddof=0) * float(multiplier)
+    data["basis"], data["upper"], data["lower"] = middle, middle + deviation, middle - deviation
+    buy = np.zeros(len(data), dtype=bool)
+    sell = np.zeros(len(data), dtype=bool)
+    green_streak = red_streak = 0
+    for i, (close, open_, upper, lower) in enumerate(zip(data.Close, data.Open, data.upper, data.lower)):
+        if pd.isna(upper) or pd.isna(lower):
             continue
-        green, red = c[i] > o[i], c[i] < o[i]
-        if green and c[i] > u[i]:
-            g += 1
-        if red and c[i] < lo[i]:
-            r += 1
-        sell[i] = red and c[i] < u[i] and g > 0
-        buy[i] = green and c[i] > lo[i] and r > 0
+        green, red = close > open_, close < open_
+        if green and close > upper:
+            green_streak += 1
+        if red and close < lower:
+            red_streak += 1
+        sell[i] = red and close < upper and green_streak > 0
+        buy[i] = green and close > lower and red_streak > 0
         if sell[i]:
-            g = 0
+            green_streak = 0
         if buy[i]:
-            r = 0
-    d["sell"], d["buy"] = sell, buy
-    return d
+            red_streak = 0
+    data["buy"], data["sell"] = buy, sell
+    return data
 
 
-def find_exit(d, start, sl, use_sl):
-    """First exit at/after bar `start`. Priority: stop-loss > target (upper BB) > sell signal."""
-    O, H, L, C, U, S = (d[x].values for x in ("Open", "High", "Low", "Close", "upper", "sell"))
-    for k in range(start, len(d)):
-        if use_sl and sl > 0 and L[k] <= sl:
-            return k, min(O[k], sl), "Stop-loss"
-        if H[k] >= U[k]:
-            return k, max(O[k], U[k]), "Target (Upper BB)"
-        if S[k]:
-            return k, C[k], "Sell signal"
+def find_exit(data, start, stop, use_stop):
+    for i in range(max(0, start), len(data)):
+        row = data.iloc[i]
+        if use_stop and stop > 0 and row.Low <= stop:
+            return i, min(row.Open, stop), "Stop-loss"
+        if pd.notna(row.upper) and row.High >= row.upper:
+            return i, max(row.Open, row.upper), "Target (Upper BB)"
+        if row.sell:
+            return i, row.Close, "Sell signal"
     return None
 
 
-def pending_buy(d, symbol, lookback, valid, use_sl):
-    """Latest buy signal (within `lookback` bars) and its confirmation status."""
-    n = len(d)
-    idx = np.where(d["buy"].values)[0]
-    if len(idx) == 0 or n - 1 - idx[-1] > lookback:
+def pending_buy(data, symbol, lookback, valid, use_stop):
+    signals = np.flatnonzero(data.buy.to_numpy())
+    if not len(signals):
         return None
-    s = idx[-1]
-    H, L, O = d["High"].values, d["Low"].values, d["Open"].values
-    trig, sl = H[s], L[s]
-    status, conf = "⏳ WAITING – buy above trigger", None
-    for j in range(s + 1, n):
-        if H[j] > trig:
-            conf = j
-            status = "✅ BUY CONFIRMED"
+    signal = int(signals[-1])
+    if len(data) - 1 - signal > lookback:
+        return None
+    trigger, stop = float(data.High.iloc[signal]), float(data.Low.iloc[signal])
+    confirmed = None
+    status = "⏳ WAITING – buy above trigger"
+    for i in range(signal + 1, min(len(data), signal + 1 + valid)):
+        if data.High.iloc[i] > trigger:
+            confirmed, status = i, "✅ BUY CONFIRMED"
             break
-        if L[j] < sl:
+        if data.Low.iloc[i] < stop:
             status = "❌ Failed (signal low broken)"
             break
-        if j - s >= valid:
-            status = "⌛ Expired"
-            break
-    if conf is not None:
-        ex = find_exit(d, conf + 1, sl, use_sl)
-        if ex:
-            status = "🏁 Already exited (" + ex[2] + ")"
-    ltp, up = d["Close"].values[-1], d["upper"].values[-1]
-    entry = max(O[conf], trig) if conf is not None else trig
-    return {
-        "Symbol": symbol, "Signal Date": d.index[s].date(),
-        "Buy Above (Trigger)": round(trig, 2), "Stop-loss (Signal Low)": round(sl, 2),
-        "Target (Upper BB)": round(up, 2), "LTP": round(ltp, 2), "Status": status,
-        "Confirmed On": d.index[conf].date() if conf is not None else None,
-        "Reward:Risk": round((up - entry) / (entry - sl), 2) if entry > sl else None,
-    }
+    if confirmed is None and status.startswith("⏳") and len(data) - 1 - signal >= valid:
+        status = "⌛ Expired"
+    if confirmed is not None and find_exit(data, confirmed + 1, stop, use_stop):
+        status = "🏁 Already exited"
+    current_upper = data.upper.iloc[-1]
+    entry = max(float(data.Open.iloc[confirmed]), trigger) if confirmed is not None else trigger
+    return {"Symbol": symbol, "Signal Date": data.index[signal].date(), "Buy Above (Trigger)": round(trigger, 2),
+            "Stop-loss": round(stop, 2), "Target (Upper BB)": round(float(current_upper), 2) if pd.notna(current_upper) else None,
+            "LTP": round(float(data.Close.iloc[-1]), 2), "Status": status,
+            "Confirmed On": data.index[confirmed].date() if confirmed is not None else None,
+            "Reward:Risk": round((current_upper - entry) / (entry - stop), 2) if pd.notna(current_upper) and entry > stop else None}
 
 
-def evaluate_holding(h, d, use_sl):
-    n = len(d)
-    idx = int(d.index.searchsorted(pd.Timestamp(h["entry_date"])))
-    sl = h.get("sl", 0) or 0
-    if sl == 0:  # auto: low of latest buy-signal candle on/before entry
-        b = np.where(d["buy"].values[: min(idx + 1, n)])[0]
-        sl = d["Low"].values[b[-1]] if len(b) else 0
-    ex = find_exit(d, idx + 1, sl, use_sl)
-    ltp = d["Close"].values[-1]
-    pnl = (ltp - h["price"]) * h["shares"]
-    if ex is None:
-        status = "🟢 HOLD"
-    elif ex[0] == n - 1:
-        status = f"🚨 EXIT NOW – {ex[2]}"
-    else:
-        status = f"🔴 EXIT DUE – {ex[2]} on {d.index[ex[0]].date()}"
-    return {
-        "Symbol": h["symbol"], "Shares": h["shares"], "Entry Price": h["price"],
-        "Entry Date": h["entry_date"], "LTP": round(ltp, 2), "P&L ₹": round(pnl, 2),
-        "P&L %": round((ltp / h["price"] - 1) * 100, 2),
-        "Stop-loss": round(sl, 2) if sl else None,
-        "Target (Upper BB)": round(d["upper"].values[-1], 2), "Status": status,
-    }
-
-
-def backtest(d, symbol, valid, use_sl, capital):
-    n = len(d)
-    O, H, L, C = (d[x].values for x in ("Open", "High", "Low", "Close"))
-    trades, free = [], 0
-    for s in np.where(d["buy"].values)[0]:
-        if s < free:
-            continue
-        trig, sl = H[s], L[s]
-        j = None
-        for t in range(s + 1, min(n, s + 1 + valid)):
-            if H[t] > trig:
-                j = t
-                break
-            if L[t] < sl:
-                break
-        if j is None:
-            continue
-        entry = max(O[j], trig)
-        ex = find_exit(d, j + 1, sl, use_sl)
-        k, price, reason = ex if ex else (n - 1, C[-1], "Still open")
-        qty = max(int(capital // entry), 1)
-        trades.append({
-            "Symbol": symbol, "Signal Date": d.index[s].date(), "Entry Date": d.index[j].date(),
-            "Entry": round(entry, 2), "Exit Date": d.index[k].date(), "Exit": round(price, 2),
-            "Exit Reason": reason, "Return %": round((price / entry - 1) * 100, 2),
-            "Qty": qty, "P&L ₹": round((price - entry) * qty, 2), "Bars Held": int(k - j),
-        })
-        free = k + 1 if ex else n
-    return trades
-
-
-# ----------------------------------------------------------------------------
-# PORTFOLIO STORAGE
-# ----------------------------------------------------------------------------
-def load_pf():
+def read_portfolio():
     try:
-        with open(PORTFOLIO_FILE) as f:
-            return json.load(f)
-    except Exception:
+        with open(PORTFOLIO_FILE, encoding="utf-8") as handle:
+            value = json.load(handle)
+        if not isinstance(value, list):
+            return []
+        valid = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            try:
+                symbol, shares = str(item["symbol"]), int(item["shares"])
+                price, entry_date = float(item["price"]), date.fromisoformat(str(item["entry_date"]))
+                if symbol and shares > 0 and price > 0:
+                    valid.append({**item, "symbol": symbol, "shares": shares, "price": price, "entry_date": str(entry_date), "sl": float(item.get("sl", 0) or 0)})
+            except (KeyError, TypeError, ValueError):
+                continue
+        return valid
+    except (OSError, json.JSONDecodeError):
         return []
 
 
-def save_pf(pf):
-    with open(PORTFOLIO_FILE, "w") as f:
-        json.dump(pf, f, indent=1)
+def write_portfolio(holdings):
+    """Atomic replacement prevents partial/corrupt portfolio files."""
+    fd, temp_path = tempfile.mkstemp(prefix="portfolio-", suffix=".json", dir=ROOT)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(holdings, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, PORTFOLIO_FILE)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
 
-# ----------------------------------------------------------------------------
-# SIDEBAR
-# ----------------------------------------------------------------------------
+def evaluate_holding(holding, data, use_stop):
+    if data.empty:
+        return None
+    entry_index = int(data.index.searchsorted(pd.Timestamp(holding["entry_date"])))
+    stop = holding.get("sl", 0) or 0
+    if stop == 0:
+        signals = np.flatnonzero(data.buy.to_numpy()[:min(entry_index + 1, len(data))])
+        if len(signals):
+            stop = float(data.Low.iloc[signals[-1]])
+    exit_info = find_exit(data, entry_index + 1, stop, use_stop)
+    latest = float(data.Close.iloc[-1])
+    pnl = (latest - holding["price"]) * holding["shares"]
+    if exit_info is None:
+        status = "🟢 HOLD"
+    elif exit_info[0] == len(data) - 1:
+        status = f"🚨 EXIT NOW – {exit_info[2]}"
+    else:
+        status = f"🔴 EXIT DUE – {exit_info[2]} on {data.index[exit_info[0]].date()}"
+    upper = data.upper.iloc[-1]
+    return {"Symbol": holding["symbol"], "Shares": holding["shares"], "Entry Price": holding["price"],
+            "Entry Date": holding["entry_date"], "LTP": round(latest, 2), "P&L ₹": round(pnl, 2),
+            "P&L %": round((latest / holding["price"] - 1) * 100, 2), "Stop-loss": round(stop, 2) if stop else None,
+            "Target (Upper BB)": round(float(upper), 2) if pd.notna(upper) else None, "Status": status}
+
+
+def run_backtest(data, symbol, valid, use_stop, capital):
+    trades, occupied_until = [], 0
+    for signal in np.flatnonzero(data.buy.to_numpy()):
+        if signal < occupied_until:
+            continue
+        trigger, stop = float(data.High.iloc[signal]), float(data.Low.iloc[signal])
+        confirmation = None
+        for i in range(signal + 1, min(len(data), signal + 1 + valid)):
+            if data.High.iloc[i] > trigger:
+                confirmation = i
+                break
+            if data.Low.iloc[i] < stop:
+                break
+        if confirmation is None:
+            continue
+        entry = max(float(data.Open.iloc[confirmation]), trigger)
+        if entry <= 0:
+            continue
+        exit_info = find_exit(data, confirmation + 1, stop, use_stop)
+        idx, price, reason = exit_info if exit_info else (len(data) - 1, float(data.Close.iloc[-1]), "Still open")
+        quantity = max(int(capital // entry), 1)
+        trades.append({"Symbol": symbol, "Signal Date": data.index[signal].date(), "Entry Date": data.index[confirmation].date(),
+                       "Entry": round(entry, 2), "Exit Date": data.index[idx].date(), "Exit": round(price, 2), "Exit Reason": reason,
+                       "Return %": round((price / entry - 1) * 100, 2), "Qty": quantity,
+                       "P&L ₹": round((price - entry) * quantity, 2), "Bars Held": int(idx - confirmation)})
+        occupied_until = idx + 1 if exit_info else len(data)
+    return trades
+
+
+# Sidebar controls
 st.sidebar.title("📈 BB Exhaustion Scanner")
 section = st.sidebar.radio("Section", SECTIONS)
-
 with st.sidebar.expander("⚙️ Strategy settings"):
-    BB_LEN = st.number_input("BB length", 5, 100, 22)
-    BB_MULT = st.number_input("BB multiplier", 0.5, 4.0, 1.5, 0.1)
-    INTERVAL = st.selectbox("Timeframe", ["1d", "1wk"], format_func=lambda x: {"1d": "Daily", "1wk": "Weekly"}[x])
-    YEARS = st.slider("History to load (years)", 1, 10, 3)
-    LOOKBACK = st.slider("Show buy signals from last N candles", 1, 30, 10)
-    VALID = st.slider("Signal valid for N candles (wait for breakout)", 1, 15, 5)
-    USE_SL = st.checkbox("Use stop-loss = low of signal candle", True)
-    SOURCE = st.selectbox("Data source", ["live", "local"], format_func=lambda x: {
-        "live": "Live (Yahoo / NSE) – use for daily scanning",
-        "local": "Local file data.json – fast, for backtests"}[x])
+    bb_length = st.number_input("BB length", 5, 100, 22)
+    bb_mult = st.number_input("BB multiplier", 0.5, 4.0, 1.5, 0.1)
+    interval = st.selectbox("Timeframe", ["1d", "1wk"], format_func=lambda value: {"1d": "Daily", "1wk": "Weekly"}[value])
+    years = st.slider("History to load (years)", 1, 10, 3)
+    lookback = st.slider("Show buy signals from last N candles", 1, 30, 10)
+    valid = st.slider("Signal valid for N candles", 1, 15, 5)
+    use_stop = st.checkbox("Use stop-loss = low of signal candle", True)
+    source = st.selectbox("Data source", ["live", "local"], format_func=lambda value: {"live": "Live (Yahoo / NSE)", "local": "Local data.json only"}[value])
 
-with st.sidebar.expander("➕ Add a bought stock", expanded=False):
-    f_idx = st.selectbox("Index", INDEX_SECTIONS, key="f_idx")
-    f_sym = st.selectbox("Stock", get_symbols(f_idx), key="f_sym")
-    f_qty = st.number_input("No. of shares", 1, 10_000_000, 10)
-    f_px = st.number_input("Buy price ₹", 0.0, 1_000_000.0, 100.0, 0.05)
-    f_dt = st.date_input("Buy date", date.today())
-    f_sl = st.number_input("Stop-loss ₹ (0 = auto from signal candle)", 0.0, 1_000_000.0, 0.0, 0.05)
+with st.sidebar.expander("➕ Add a bought stock"):
+    index_name = st.selectbox("Index", INDEXES, key="holding_index")
+    choices = get_symbols(index_name) or UNIVERSE[index_name]
+    symbol = st.selectbox("Stock", choices, key="holding_symbol")
+    quantity = st.number_input("No. of shares", 1, 10_000_000, 10)
+    price = st.number_input("Buy price ₹", 0.01, 1_000_000.0, 100.0, 0.05)
+    buy_date = st.date_input("Buy date", date.today())
+    stop_price = st.number_input("Stop-loss ₹ (0 = automatic)", 0.0, 1_000_000.0, 0.0, 0.05)
     if st.button("Save holding", type="primary"):
-        pf = load_pf()
-        pf.append({"index": f_idx, "symbol": f_sym, "shares": int(f_qty), "price": float(f_px),
-                   "entry_date": str(f_dt), "sl": float(f_sl)})
-        save_pf(pf)
-        st.success(f"Saved {f_sym}")
+        holdings = read_portfolio()
+        holdings.append({"index": index_name, "symbol": symbol, "shares": int(quantity), "price": float(price), "entry_date": str(buy_date), "sl": float(stop_price)})
+        try:
+            write_portfolio(holdings)
+            st.success(f"Saved {symbol}")
+        except OSError:
+            st.error("Could not save your portfolio. Check that the app folder is writable.")
 
 if st.sidebar.button("🔄 Refresh lists from NSE"):
-    bad = refresh_lists()
-    st.sidebar.warning("Could not refresh: " + ", ".join(bad)) if bad else st.sidebar.success("Lists updated")
-st.sidebar.caption("Signals use closed candles. Best to scan after 3:30 PM IST.")
+    failures = refresh_lists()
+    if failures:
+        st.sidebar.warning("Could not refresh: " + ", ".join(failures) + ". Existing lists are kept.")
+    else:
+        st.sidebar.success("Lists updated")
+st.sidebar.caption("Signals use closed candles. Review all signals; this is not financial advice.")
 
 
-def ind_data(symbols):
-    raw = load_many(tuple(symbols), YEARS, INTERVAL, SOURCE)
-    return {s: add_ind(df, BB_LEN, BB_MULT) for s, df in raw.items()}
+def get_indicators(symbols):
+    loaded = load_many(tuple(symbols), int(years), interval, source)
+    return {key: add_indicators(frame, bb_length, bb_mult) for key, frame in loaded.items() if len(frame) >= bb_length}
 
 
-def holdings_table(pf, data):
-    rows = [evaluate_holding(h, data[h["symbol"]], USE_SL) for h in pf if h["symbol"] in data]
-    missing = [h["symbol"] for h in pf if h["symbol"] not in data]
+def show_holdings(holdings, prices):
+    rows = [evaluate_holding(item, prices[item["symbol"]], use_stop) for item in holdings if item["symbol"] in prices]
+    missing = sorted({item["symbol"] for item in holdings if item["symbol"] not in prices})
     if missing:
-        st.warning("No price data for: " + ", ".join(missing))
+        st.warning("No usable price data for: " + ", ".join(missing))
+    rows = [row for row in rows if row]
     if rows:
-        df = pd.DataFrame(rows)
-        urgent = df["Status"].str.contains("EXIT")
+        frame = pd.DataFrame(rows)
+        urgent = frame["Status"].str.contains("EXIT", na=False)
         if urgent.any():
-            st.error(f"{int(urgent.sum())} holding(s) need an exit: " + ", ".join(df.loc[urgent, "Symbol"]))
-        st.dataframe(df, use_container_width=True, hide_index=True)
-        st.caption(f"Total P&L: ₹{df['P&L ₹'].sum():,.2f}")
-    else:
-        st.info("No holdings yet. Use '➕ Add a bought stock' in the sidebar.")
+            st.error(f"{int(urgent.sum())} holding(s) need attention: " + ", ".join(frame.loc[urgent, "Symbol"]))
+        st.dataframe(frame, use_container_width=True, hide_index=True)
+        st.caption(f"Total P&L: ₹{frame['P&L ₹'].sum():,.2f}")
+    elif not missing:
+        st.info("No holdings yet. Add one using the sidebar.")
 
 
-# ----------------------------------------------------------------------------
-# PAGES
-# ----------------------------------------------------------------------------
-if section in INDEX_SECTIONS:
+if section in INDEXES:
     st.title(section)
-    syms = get_symbols(section)
-    with st.spinner(f"Loading {len(syms)} stocks..."):
-        data = ind_data(syms)
-    st.caption(f"{len(data)}/{len(syms)} stocks loaded • last candle: "
-               f"{max(d.index[-1] for d in data.values()).date() if data else 'n/a'}")
-    if len(data) < len(syms):
-        st.warning("Missing data for: " + ", ".join(sorted(set(syms) - set(data))))
-
+    symbols = get_symbols(section)
+    with st.spinner(f"Loading market data for {len(symbols)} stocks…"):
+        indicators = get_indicators(symbols)
+    latest = max((frame.index[-1].date() for frame in indicators.values()), default="n/a")
+    st.caption(f"{len(indicators)}/{len(symbols)} stocks loaded • latest candle: {latest}")
+    missing = sorted(set(symbols) - set(indicators))
+    if missing:
+        st.warning("Some stocks did not return enough valid data: " + ", ".join(missing))
     st.subheader("🟢 Buy signals")
-    rows = [r for s, d in data.items() if (r := pending_buy(d, s, LOOKBACK, VALID, USE_SL))]
-    show_all = st.checkbox("Also show failed / expired / exited signals", False, key=f"all_{section}")
+    rows = [result for name, frame in indicators.items() if (result := pending_buy(frame, name, lookback, valid, use_stop))]
+    show_all = st.checkbox("Also show failed / expired / exited signals", False, key=f"show_all_{section}")
     if not show_all:
-        rows = [r for r in rows if r["Status"].startswith(("✅", "⏳"))]
+        rows = [row for row in rows if row["Status"].startswith(("✅", "⏳"))]
     if rows:
-        df = pd.DataFrame(rows).sort_values(["Status", "Signal Date"], ascending=[False, False])
-        st.dataframe(df, use_container_width=True, hide_index=True)
-        st.caption("BUY only when status is ✅ (price has crossed the signal candle's high). "
-                   "⏳ = place a buy-stop above the trigger price.")
+        st.dataframe(pd.DataFrame(rows).sort_values(["Status", "Signal Date"], ascending=[False, False]), use_container_width=True, hide_index=True)
     else:
-        st.info("No active buy signals right now.")
-
+        st.info("No matching buy signals in the selected lookback period.")
     st.subheader("🔴 Exit alerts – your holdings in this index")
-    pf = [h for h in load_pf() if h["index"] == section]
-    holdings_table(pf, data)
+    show_holdings([item for item in read_portfolio() if item.get("index") == section], indicators)
 
 elif section == "My Portfolio":
     st.title("My Portfolio")
-    pf = load_pf()
-    if pf:
-        need = sorted({h["symbol"] for h in pf})
-        with st.spinner("Loading prices..."):
-            data = ind_data(need)
-        holdings_table(pf, data)
-        st.divider()
-        labels = [f"{i + 1}. {h['symbol']} – {h['shares']} @ {h['price']} ({h['entry_date']})" for i, h in enumerate(pf)]
-        pick = st.selectbox("Remove a holding (sold)", labels)
-        if st.button("Remove"):
-            pf.pop(labels.index(pick))
-            save_pf(pf)
-            st.rerun()
+    holdings = read_portfolio()
+    if holdings:
+        with st.spinner("Loading holding prices…"):
+            indicators = get_indicators(sorted({item["symbol"] for item in holdings}))
+        show_holdings(holdings, indicators)
+        labels = [f"{i + 1}. {item['symbol']} – {item['shares']} shares @ ₹{item['price']} ({item['entry_date']})" for i, item in enumerate(holdings)]
+        selected = st.selectbox("Remove a holding (sold)", labels)
+        if st.button("Remove holding"):
+            holdings.pop(labels.index(selected))
+            try:
+                write_portfolio(holdings)
+                st.rerun()
+            except OSError:
+                st.error("Could not update the portfolio file.")
     else:
-        st.info("No holdings yet. Use '➕ Add a bought stock' in the sidebar.")
+        st.info("No holdings yet. Add one using the sidebar.")
 
-else:  # Backtest
+else:
     st.title("Backtest")
-    c1, c2, c3 = st.columns(3)
-    which = c1.selectbox("Stocks", INDEX_SECTIONS + ["All three indices"])
-    bt_years = c2.slider("Years of history", 1, 10, 5)
-    capital = c3.number_input("Capital per trade ₹", 1000, 10_000_000, 50_000, 1000)
+    col1, col2, col3 = st.columns(3)
+    choice = col1.selectbox("Stocks", INDEXES + ["All three indices"])
+    test_years = col2.slider("Years of history", 1, 10, 5)
+    capital = col3.number_input("Capital per trade ₹", 1000, 10_000_000, 50_000, 1000)
     if st.button("Run backtest", type="primary"):
-        syms = sorted({s for n in INDEX_SECTIONS for s in get_symbols(n)}) if which == "All three indices" else get_symbols(which)
-        with st.spinner("Downloading data..."):
-            raw = load_many(tuple(syms), bt_years, INTERVAL, SOURCE)
+        symbols = sorted({item for name in INDEXES for item in get_symbols(name)}) if choice == "All three indices" else get_symbols(choice)
+        with st.spinner(f"Downloading data for {len(symbols)} stocks…"):
+            raw = load_many(tuple(symbols), int(test_years), interval, source)
         trades = []
-        bar = st.progress(0.0)
-        for i, (s, df) in enumerate(raw.items()):
-            trades += backtest(add_ind(df, BB_LEN, BB_MULT), s, VALID, USE_SL, capital)
-            bar.progress((i + 1) / len(raw))
+        usable = [(name, frame) for name, frame in raw.items() if len(frame) >= bb_length]
+        progress = st.progress(0.0)
+        for i, (name, frame) in enumerate(usable):
+            trades.extend(run_backtest(add_indicators(frame, bb_length, bb_mult), name, valid, use_stop, capital))
+            progress.progress((i + 1) / max(len(usable), 1))
         if not trades:
-            st.warning("No trades generated.")
+            st.warning("No trades generated. Check data availability and settings.")
         else:
-            t = pd.DataFrame(trades).sort_values("Exit Date")
-            wins, losses = t[t["P&L ₹"] > 0], t[t["P&L ₹"] <= 0]
-            m = st.columns(5)
-            m[0].metric("Trades", len(t))
-            m[1].metric("Win rate", f"{len(wins) / len(t) * 100:.1f}%")
-            m[2].metric("Avg return/trade", f"{t['Return %'].mean():.2f}%")
-            m[3].metric("Net P&L", f"₹{t['P&L ₹'].sum():,.0f}")
-            pf_ratio = wins["P&L ₹"].sum() / abs(losses["P&L ₹"].sum()) if len(losses) and losses["P&L ₹"].sum() else float("inf")
-            m[4].metric("Profit factor", f"{pf_ratio:.2f}")
-            eq = t.assign(Equity=t["P&L ₹"].cumsum()).set_index(pd.to_datetime(t["Exit Date"]))["Equity"]
+            trade_frame = pd.DataFrame(trades).sort_values("Exit Date")
+            winners = trade_frame[trade_frame["P&L ₹"] > 0]
+            losers = trade_frame[trade_frame["P&L ₹"] <= 0]
+            metrics = st.columns(5)
+            metrics[0].metric("Trades", len(trade_frame))
+            metrics[1].metric("Win rate", f"{len(winners) / len(trade_frame) * 100:.1f}%")
+            metrics[2].metric("Avg return/trade", f"{trade_frame['Return %'].mean():.2f}%")
+            metrics[3].metric("Net P&L", f"₹{trade_frame['P&L ₹'].sum():,.0f}")
+            loss_total = abs(losers["P&L ₹"].sum())
+            profit_factor = winners["P&L ₹"].sum() / loss_total if loss_total else float("inf")
+            metrics[4].metric("Profit factor", f"{profit_factor:.2f}")
+            equity = trade_frame.assign(Equity=trade_frame["P&L ₹"].cumsum()).set_index(pd.to_datetime(trade_frame["Exit Date"]))["Equity"]
             st.subheader("Equity curve (cumulative P&L ₹)")
-            st.line_chart(eq)
+            st.line_chart(equity)
             st.subheader("By exit reason")
-            st.dataframe(t.groupby("Exit Reason").agg(Trades=("Symbol", "count"), AvgReturnPct=("Return %", "mean"),
-                                                      NetPnL=("P&L ₹", "sum")).round(2), use_container_width=True)
+            summary = trade_frame.groupby("Exit Reason").agg(Trades=("Symbol", "count"), AvgReturnPct=("Return %", "mean"), NetPnL=("P&L ₹", "sum")).round(2)
+            st.dataframe(summary, use_container_width=True)
             st.subheader("All trades")
-            st.dataframe(t, use_container_width=True, hide_index=True)
-            st.download_button("Download trades CSV", t.to_csv(index=False), "backtest_trades.csv", "text/csv")
-            st.caption("Entry = max(open, signal-candle high) on the breakout candle. Exit priority: stop-loss, "
-                       "upper-BB target, sell signal. No brokerage/slippage included. Past results ≠ future returns.")
+            st.dataframe(trade_frame, use_container_width=True, hide_index=True)
+            st.download_button("Download trades CSV", trade_frame.to_csv(index=False), "backtest_trades.csv", "text/csv")
+            st.caption("No brokerage or slippage included. Historical results do not guarantee future performance.")
