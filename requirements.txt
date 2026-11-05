@@ -4,3 +4,4 @@ pandas==2.2.3
 numpy==1.26.4
 requests>=2.31,<3.0
 jugaad-data
+plotly>=5.18,<7
