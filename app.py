@@ -17,9 +17,9 @@ PORTFOLIO_FILE = os.path.join(ROOT, "portfolio.json")
 DATA_FILE = os.path.join(ROOT, "data.json")
 
 UNIVERSE = {
-    "Nifty 50": "ADANIENT ADANIPORTS APOLLOHOSP ASIANPAINT AXISBANK BAJAJ-AUTO BAJAJFINSV BAJFINANCE BEL BHARTIARTL CIPLA COALINDIA DRREDDY EICHERMOT ETERNAL GRASIM HCLTECH HDFCBANK HDFCLIFE HEROMOTOCO HINDALCO HINDUNILVR ICICIBANK INDUSINDBK INFY ITC JIOFIN JSWSTEEL KOTAKBANK LT M&M MARUTI NESTLEIND NTPC ONGC POWERGRID RELIANCE SBILIFE SBIN SHRIRAMFIN SUNPHARMA TATACONSUM TATASTEEL TCS TECHM TITAN TRENT ULTRACEMCO WIPRO",
-    "Nifty Alpha 50": "ABCAPITAL ADANIPOWER AUROPHARMA BDL BEL BHARATFORG BSE CGPOWER COFORGE DIXON ETERNAL GMRAIRPORT HAL HDFCAMC HINDZINC INDHOTEL INDIGO IRFC JINDALSTEL JSWENERGY LAURUSLABS LUPIN MAZDOCK MCX MUTHOOTFIN NATIONALUM NAUKRI OFSS PERSISTENT PFC PRESTIGE RECLTD SOLARINDS SRF SUZLON TATAELXSI TORNTPOWER TRENT TVSMOTOR VEDL VOLTAS",
-    "Midcap High Beta": "ADANIENT ADANIPORTS ADANIPOWER ASHOKLEY BANKBARODA BHARATFORG BHEL CANBK DLF FEDERALBNK GMRAIRPORT HINDALCO HUDCO IDEA IDFCFIRSTB IREDA IRFC JINDALSTEL JSWSTEEL LICHSGFIN MOTHERSON NATIONALUM NBCC NMDC OIL PFC PNB RECLTD RVNL SAIL SUZLON TATAPOWER TATASTEEL UNIONBANK VEDL YESBANK",
+    "Nifty 50": "ADANIENT ADANIPORTS APOLLOHOSP ASIANPAINT AXISBANK BAJAJ-AUTO BAJAJFINSV BAJFINANCE BEL BHARTIARTL CIPLA COALINDIA DRREDDY EICHERMOT ETERNAL GRASIM HCLTECH HDFCBANK HDFCLIFE HEROMOTOCORP HINDALCO HINDUNILVR ICICIBANK INDUSINDBK INFY ITC JSWSTEEL KOTAKBANK LT M&M MARUTI NTPC OIL OLAELEC POWERGRID RELIANCE SBILIFE SBIN SUNPHARMA TCS TATACONSUM TATAMOTORS TATAPOWER TATASTEEL TECHM TITAN ULTRACEMCO WIPRO",
+    "Nifty Alpha 50": "ABCAPITAL ADANIPOWER AUROPHARMA BDL BEL BHARATFORG BSE CGPOWER COFORGE DIXON ETERNAL GMRAIRPORT HAL HDFCAMC HINDZINC INDHOTEL INDIGO IRFC JINDALSTEL JSWENERGY LAURUSLABS LUPIN MAZDOCK MUTHOOTFIN NAUKRI NESTLE PERSISTENT PETRONET POWERGRID PRESTIGE RBLBANK SAMVARDHNA SAIL SBICARD SHREECEM SONACOMS SSUBANK TATACOMM TATAPOWER TATASTEEL TCS TORNTPHARM TRENT TVSMOTOR ULTRACEMCO VOLTAS WIPRO",
+    "Midcap High Beta": "ADANIENT ADANIPORTS ADANIPOWER ASHOKLEY BANKBARODA BHARATFORG BHEL CANBK DLF FEDERALBNK GMRAIRPORT HINDALCO HUDCO IDEA IDFCFIRSTB IREDA IRFC JINDALSTEL JSWSTEEL LICHSGFIN MOTHERSONS NATCOPHARM NIFTYBEES NTPC ONGC PFC QUESSCORP RBLBANK RELIANCE SAFARIIND SAIL SBIN SJVN SUNPHARMA TATAMOTORS TATAPOWER TATASTEEL TORNTPHARM TRENT UPL YESBANK ZEEL",
 }
 UNIVERSE = {k: sorted(set(v.split())) for k, v in UNIVERSE.items()}
 INDEXES = list(UNIVERSE)
@@ -175,7 +175,7 @@ def add_indicators(frame, length, multiplier):
     data = frame.copy()
     middle = data["Close"].rolling(int(length), min_periods=int(length)).mean()
     deviation = data["Close"].rolling(int(length), min_periods=int(length)).std(ddof=0) * float(multiplier)
-    data["basis"], data["upper"], data["lower"] = middle, middle + deviation, middle - deviation
+    data["basis"], data["middle"], data["upper"], data["lower"] = middle, middle, middle + deviation, middle - deviation
     buy = np.zeros(len(data), dtype=bool)
     sell = np.zeros(len(data), dtype=bool)
     green_streak = red_streak = 0
@@ -197,16 +197,47 @@ def add_indicators(frame, length, multiplier):
     return data
 
 
-def find_exit(data, start, stop, use_stop):
+def get_exit_plan(data, start, stop, use_stop):
+    """Return sequential exits as (index, price, reason, fraction)."""
+    events = []
     for i in range(max(0, start), len(data)):
         row = data.iloc[i]
+
         if use_stop and stop > 0 and row.Low <= stop:
-            return i, min(row.Open, stop), "Stop-loss"
-        if pd.notna(row.upper) and row.High >= row.upper:
-            return i, max(row.Open, row.upper), "Target (Upper BB)"
+            remaining = 1.0 - sum(evt[3] for evt in events)
+            if remaining <= 0:
+                return events
+            return events + [(i, min(row.Open, stop), "Stop-loss", remaining)]
+
+        if pd.notna(row.middle) and row.High >= row.middle:
+            remaining = 1.0 - sum(evt[3] for evt in events)
+            if remaining > 0:
+                events.append((i, max(row.Open, row.middle), "Target (Middle BB) – 30% exit", 0.30))
+                remaining_after_mid = 1.0 - sum(evt[3] for evt in events)
+                if remaining_after_mid <= 0:
+                    return events
+
+                for j in range(i + 1, len(data)):
+                    next_row = data.iloc[j]
+                    if use_stop and stop > 0 and next_row.Low <= stop:
+                        return events + [(j, min(next_row.Open, stop), "Stop-loss", remaining_after_mid)]
+                    if pd.notna(next_row.upper) and next_row.High >= next_row.upper:
+                        return events + [(j, max(next_row.Open, next_row.upper), "Target (Upper BB) – remaining exit", remaining_after_mid)]
+                    if next_row.sell:
+                        return events + [(j, next_row.Close, "Sell signal", remaining_after_mid)]
+                return events
+
         if row.sell:
-            return i, row.Close, "Sell signal"
-    return None
+            remaining = 1.0 - sum(evt[3] for evt in events)
+            if remaining > 0:
+                return events + [(i, row.Close, "Sell signal", remaining)]
+
+    return events
+
+
+def find_exit(data, start, stop, use_stop):
+    events = get_exit_plan(data, start, stop, use_stop)
+    return events[0] if events else None
 
 
 def pending_buy(data, symbol, lookback, valid, use_stop):
@@ -230,10 +261,12 @@ def pending_buy(data, symbol, lookback, valid, use_stop):
         status = "⌛ Expired"
     if confirmed is not None and find_exit(data, confirmed + 1, stop, use_stop):
         status = "🏁 Already exited"
+    current_middle = data.middle.iloc[-1]
     current_upper = data.upper.iloc[-1]
     entry = max(float(data.Open.iloc[confirmed]), trigger) if confirmed is not None else trigger
     return {"Symbol": symbol, "Signal Date": data.index[signal].date(), "Buy Above (Trigger)": round(trigger, 2),
-            "Stop-loss": round(stop, 2), "Target (Upper BB)": round(float(current_upper), 2) if pd.notna(current_upper) else None,
+            "Stop-loss": round(stop, 2), "Target (Middle BB)": round(float(current_middle), 2) if pd.notna(current_middle) else None,
+            "Target (Upper BB)": round(float(current_upper), 2) if pd.notna(current_upper) else None,
             "LTP": round(float(data.Close.iloc[-1]), 2), "Status": status,
             "Confirmed On": data.index[confirmed].date() if confirmed is not None else None,
             "Reward:Risk": round((current_upper - entry) / (entry - stop), 2) if pd.notna(current_upper) and entry > stop else None}
@@ -297,6 +330,7 @@ def evaluate_holding(holding, data, use_stop):
     return {"Symbol": holding["symbol"], "Shares": holding["shares"], "Entry Price": holding["price"],
             "Entry Date": holding["entry_date"], "LTP": round(latest, 2), "P&L ₹": round(pnl, 2),
             "P&L %": round((latest / holding["price"] - 1) * 100, 2), "Stop-loss": round(stop, 2) if stop else None,
+            "Target (Middle BB)": round(float(data.middle.iloc[-1]), 2) if pd.notna(data.middle.iloc[-1]) else None,
             "Target (Upper BB)": round(float(upper), 2) if pd.notna(upper) else None, "Status": status}
 
 
@@ -318,14 +352,24 @@ def run_backtest(data, symbol, valid, use_stop, capital):
         entry = max(float(data.Open.iloc[confirmation]), trigger)
         if entry <= 0:
             continue
-        exit_info = find_exit(data, confirmation + 1, stop, use_stop)
-        idx, price, reason = exit_info if exit_info else (len(data) - 1, float(data.Close.iloc[-1]), "Still open")
+
         quantity = max(int(capital // entry), 1)
+        events = get_exit_plan(data, confirmation + 1, stop, use_stop)
+        if not events:
+            events = [(len(data) - 1, float(data.Close.iloc[-1]), "Still open", 1.0)]
+        total_fraction = sum(event[3] for event in events)
+        if total_fraction <= 0:
+            total_fraction = 1.0
+        exit_idx = events[-1][0]
+        exit_price = events[-1][1]
+        exit_reason = "; ".join(event[2] for event in events)
+        pnl = sum((price - entry) * quantity * fraction for _, price, _, fraction in events)
+
         trades.append({"Symbol": symbol, "Signal Date": data.index[signal].date(), "Entry Date": data.index[confirmation].date(),
-                       "Entry": round(entry, 2), "Exit Date": data.index[idx].date(), "Exit": round(price, 2), "Exit Reason": reason,
-                       "Return %": round((price / entry - 1) * 100, 2), "Qty": quantity,
-                       "P&L ₹": round((price - entry) * quantity, 2), "Bars Held": int(idx - confirmation)})
-        occupied_until = idx + 1 if exit_info else len(data)
+                       "Entry": round(entry, 2), "Exit Date": data.index[exit_idx].date(), "Exit": round(exit_price, 2), "Exit Reason": exit_reason,
+                       "Return %": round((pnl / (entry * quantity)) * 100, 2), "Qty": quantity,
+                       "P&L ₹": round(pnl, 2), "Bars Held": int(exit_idx - confirmation)})
+        occupied_until = exit_idx + 1 if events and events[-1][2] != "Still open" else len(data)
     return trades
 
 
