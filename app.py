@@ -559,7 +559,7 @@ else:
             usable = [(name, frame) for name, frame in raw.items() if len(frame) >= bb_length]
             progress = st.progress(0.0)
             for i, (name, frame) in enumerate(usable):
-                trades.extend(run_backtest(add_indicators(frame, bb_length, bb_mult), name, valid, capital, target_pct, use_stop=use_stop))
+                trades.extend(run_backtest(add_indicators(frame, bb_length, bb_mult), name, valid, capital, target_pct))
                 progress.progress((i + 1) / max(len(usable), 1))
             if not trades:
                 st.warning("No trades generated. Check data availability and settings.")
