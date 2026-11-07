@@ -209,17 +209,39 @@ def add_indicators(frame, length, multiplier):
     return data
 
 
-def find_exit(data, start, entry_price):
-    """Exit only after price reaches at least 5% profit; never apply a stop-loss."""
-    profit_target = float(entry_price) * 1.05
+def confirmed_buys(data, valid):
+    """Return (signal index, confirmation index, entry price) for each valid buy."""
+    entries = []
+    for signal in np.flatnonzero(data.buy.to_numpy()):
+        trigger = float(data.High.iloc[signal])
+        for confirmation in range(int(signal) + 1, min(len(data), int(signal) + 1 + int(valid))):
+            if data.High.iloc[confirmation] > trigger:
+                price = max(float(data.Open.iloc[confirmation]), trigger)
+                if price > 0:
+                    entries.append((int(signal), confirmation, price))
+                break
+    return entries
+
+
+def exit_on_bar(data, index, average_entry):
+    """Exit only at an upper-BB touch or sell signal with at least 5% profit."""
+    row = data.iloc[index]
+    profit_target = float(average_entry) * 1.05
+    if pd.notna(row.upper) and row.High >= row.upper:
+        target_price = max(float(row.Open), float(row.upper))
+        if target_price >= profit_target:
+            return index, target_price, "Target (Upper BB, +5%)"
+    if bool(row.sell) and float(row.Close) >= profit_target:
+        return index, float(row.Close), "Sell signal (+5%)"
+    return None
+
+
+def find_exit(data, start, average_entry):
+    """Scan forward for a qualifying exit; intentionally has no stop-loss."""
     for i in range(max(0, start), len(data)):
-        row = data.iloc[i]
-        if pd.notna(row.upper) and row.High >= row.upper:
-            target_price = max(float(row.Open), float(row.upper))
-            if target_price >= profit_target:
-                return i, target_price, "Target (Upper BB, +5%)"
-        if bool(row.sell) and float(row.Close) >= profit_target:
-            return i, float(row.Close), "Sell signal (+5%)"
+        result = exit_on_bar(data, i, average_entry)
+        if result:
+            return result
     return None
 
 
@@ -289,13 +311,33 @@ def write_portfolio(holdings):
             os.remove(temp_path)
 
 
-def evaluate_holding(holding, data):
+def evaluate_holding(holding, data, valid):
+    """Show a model average if fresh confirmed buy signals add equal initial capital."""
     if data.empty:
         return None
     entry_index = int(data.index.searchsorted(pd.Timestamp(holding["entry_date"])))
-    exit_info = find_exit(data, entry_index + 1, holding["price"])
+    quantity = int(holding["shares"])
+    invested = float(holding["shares"] * holding["price"])
+    add_on_buys = 0
+    setups = confirmed_buys(data, valid)
+    setups = [setup for setup in setups if setup[0] > entry_index and setup[1] > entry_index]
+    setup_cursor = 0
+    exit_info = None
+    for i in range(max(0, entry_index + 1), len(data)):
+        while setup_cursor < len(setups) and setups[setup_cursor][1] == i:
+            add_price = setups[setup_cursor][2]
+            add_qty = max(int(invested // add_price), 1)
+            quantity += add_qty
+            invested += add_qty * add_price
+            add_on_buys += 1
+            setup_cursor += 1
+        average_entry = invested / quantity
+        exit_info = exit_on_bar(data, i, average_entry)
+        if exit_info:
+            break
+    average_entry = invested / quantity
     latest = float(data.Close.iloc[-1])
-    pnl = (latest - holding["price"]) * holding["shares"]
+    pnl = latest * quantity - invested
     if exit_info is None:
         status = "🟢 HOLD"
     elif exit_info[0] == len(data) - 1:
@@ -303,36 +345,61 @@ def evaluate_holding(holding, data):
     else:
         status = f"🔴 EXIT DUE – {exit_info[2]} on {data.index[exit_info[0]].date()}"
     upper = data.upper.iloc[-1]
-    return {"Symbol": holding["symbol"], "Shares": holding["shares"], "Entry Price": holding["price"],
-            "Entry Date": holding["entry_date"], "LTP": round(latest, 2), "P&L ₹": round(pnl, 2),
-            "P&L %": round((latest / holding["price"] - 1) * 100, 2),
+    held_bars = max(0, len(data) - 1 - entry_index)
+    return {"Symbol": holding["symbol"], "Shares (incl. modeled adds)": quantity,
+            "Original Entry": round(float(holding["price"]), 2), "Average Entry": round(average_entry, 2),
+            "Add-on Buys": add_on_buys, "Entry Date": holding["entry_date"], "Holding Period (bars)": held_bars,
+            "LTP": round(latest, 2), "P&L ₹ (incl. modeled adds)": round(pnl, 2),
+            "P&L %": round((latest / average_entry - 1) * 100, 2),
             "Target (Upper BB)": round(float(upper), 2) if pd.notna(upper) else None, "Status": status}
 
 
 def run_backtest(data, symbol, valid, capital):
-    trades, occupied_until = [], 0
-    for signal in np.flatnonzero(data.buy.to_numpy()):
-        if signal < occupied_until:
-            continue
-        trigger = float(data.High.iloc[signal])
-        confirmation = None
-        for i in range(signal + 1, min(len(data), signal + 1 + valid)):
-            if data.High.iloc[i] > trigger:
-                confirmation = i
+    setups = confirmed_buys(data, valid)
+    trades = []
+    cursor = 0
+    while cursor < len(setups):
+        first_signal, first_entry_index, first_entry = setups[cursor]
+        cursor += 1
+        quantity = max(int(capital // first_entry), 1)
+        invested = quantity * first_entry
+        add_on_buys = 0
+        exit_info = None
+        final_index = len(data) - 1
+        for i in range(first_entry_index + 1, len(data)):
+            # Reinvest the same per-entry capital on each later confirmed buy while
+            # the position is open; recalculate average cost before testing exits.
+            while cursor < len(setups) and setups[cursor][1] == i:
+                signal_index, _, add_price = setups[cursor]
+                if signal_index > first_signal:
+                    add_qty = max(int(capital // add_price), 1)
+                    quantity += add_qty
+                    invested += add_qty * add_price
+                    add_on_buys += 1
+                cursor += 1
+            average_entry = invested / quantity
+            exit_info = exit_on_bar(data, i, average_entry)
+            if exit_info:
+                final_index = i
                 break
-        if confirmation is None:
-            continue
-        entry = max(float(data.Open.iloc[confirmation]), trigger)
-        if entry <= 0:
-            continue
-        exit_info = find_exit(data, confirmation + 1, entry)
-        idx, price, reason = exit_info if exit_info else (len(data) - 1, float(data.Close.iloc[-1]), "Still open")
-        quantity = max(int(capital // entry), 1)
-        trades.append({"Symbol": symbol, "Signal Date": data.index[signal].date(), "Entry Date": data.index[confirmation].date(),
-                       "Entry": round(entry, 2), "Exit Date": data.index[idx].date(), "Exit": round(price, 2), "Exit Reason": reason,
-                       "Return %": round((price / entry - 1) * 100, 2), "Qty": quantity,
-                       "P&L ₹": round((price - entry) * quantity, 2), "Bars Held": int(idx - confirmation)})
-        occupied_until = idx + 1 if exit_info else len(data)
+        average_entry = invested / quantity
+        if exit_info:
+            final_index, final_price, reason = exit_info
+        else:
+            final_price, reason = float(data.Close.iloc[-1]), "Still open"
+        pnl = final_price * quantity - invested
+        trades.append({"Symbol": symbol, "Signal Date": data.index[first_signal].date(),
+                       "Entry Date": data.index[first_entry_index].date(), "Initial Entry": round(first_entry, 2),
+                       "Average Entry": round(average_entry, 2), "Add-on Buys": add_on_buys,
+                       "Total Invested ₹": round(invested, 2), "Exit Date": data.index[final_index].date(),
+                       "Exit": round(final_price, 2), "Exit Reason": reason, "Return %": round(pnl / invested * 100, 2),
+                       "Qty": quantity, "P&L ₹": round(pnl, 2), "Bars Held": int(final_index - first_entry_index)})
+        if not exit_info:
+            break
+        # Any additional confirmed entries on the exit candle were included above;
+        # next trade starts with the first later setup.
+        while cursor < len(setups) and setups[cursor][1] <= final_index:
+            cursor += 1
     return trades
 
 
@@ -369,7 +436,7 @@ if st.sidebar.button("🔄 Refresh lists from NSE"):
         st.sidebar.warning("Could not refresh: " + ", ".join(failures) + ". Existing lists are kept.")
     else:
         st.sidebar.success("Lists updated")
-st.sidebar.caption("Exits require at least 5% profit. No stop-loss is applied. Historical results are not financial advice.")
+st.sidebar.caption("A confirmed buy while holding adds the same capital again. Exit requires at least 5% profit on average entry; no stop-loss is used.")
 
 
 def get_indicators(symbols):
@@ -378,7 +445,7 @@ def get_indicators(symbols):
 
 
 def show_holdings(holdings, prices):
-    rows = [evaluate_holding(item, prices[item["symbol"]]) for item in holdings if item["symbol"] in prices]
+    rows = [evaluate_holding(item, prices[item["symbol"]], valid) for item in holdings if item["symbol"] in prices]
     missing = sorted({item["symbol"] for item in holdings if item["symbol"] not in prices})
     if missing:
         st.warning("No usable price data for: " + ", ".join(missing))
@@ -387,9 +454,9 @@ def show_holdings(holdings, prices):
         frame = pd.DataFrame(rows)
         urgent = frame["Status"].str.contains("EXIT", na=False)
         if urgent.any():
-            st.error(f"{int(urgent.sum())} holding(s) need attention: " + ", ".join(frame.loc[urgent, "Symbol"]))
+            st.error(f"{int(urgent.sum())} holding(s) have exit alerts: " + ", ".join(frame.loc[urgent, "Symbol"]))
         st.dataframe(frame, use_container_width=True, hide_index=True)
-        st.caption(f"Total P&L: ₹{frame['P&L ₹'].sum():,.2f}")
+        st.caption("Add-on quantities, average entry, and P&L are strategy estimates assuming each confirmed add-on uses the original holding's invested amount; they do not execute trades or update your saved portfolio.")
     elif not missing:
         st.info("No holdings yet. Add one using the sidebar.")
 
@@ -440,7 +507,7 @@ elif section == "My Portfolio":
 
 else:
     st.title("Backtest")
-    st.caption("Select an index or enter an individual NSE symbol, such as NSE:MCX. Trades exit only after reaching at least 5% profit; no stop-loss is used.")
+    st.caption("Select an index or enter an individual NSE symbol, such as NSE:MCX. Confirmed buy signals add the same capital to open trades; exits require at least 5% profit on average entry. No stop-loss is used.")
     col1, col2, col3 = st.columns(3)
     choice = col1.selectbox("Stocks", INDEXES + ["All listed indices", "Custom stock"])
     test_years = col2.slider("Years of history", 1, 10, 5)
