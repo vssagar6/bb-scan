@@ -56,7 +56,6 @@ def clean_prices(frame):
     if frame is None or frame.empty:
         return None
     if isinstance(frame.columns, pd.MultiIndex):
-        # For a single ticker yfinance may return either level order.
         for level in range(frame.columns.nlevels):
             vals = set(map(str, frame.columns.get_level_values(level)))
             if {"Open", "High", "Low", "Close"}.issubset(vals):
@@ -505,7 +504,7 @@ def show_holdings(holdings, prices):
         frame = pd.DataFrame(rows)
         urgent = frame["Status"].str.contains("EXIT", na=False)
         if urgent.any():
-            st.error(f"{int(urgent.sum())} holding(s) need attention: " + ", ".join(frame.loc[urgent, 'Symbol"]))
+            st.error(f"{int(urgent.sum())} holding(s) need attention: {', '.join(frame.loc[urgent, 'Symbol'])}")
         st.dataframe(frame, use_container_width=True, hide_index=True)
         st.caption(f"Total P&L: ₹{frame['P&L ₹'].sum():,.2f}")
     elif not missing:
