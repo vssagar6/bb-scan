@@ -16,7 +16,6 @@ st.set_page_config(page_title="BB Exhaustion Scanner", page_icon="📈", layout=
 ROOT = os.path.dirname(os.path.abspath(__file__))
 PORTFOLIO_FILE = os.path.join(ROOT, "portfolio.json")
 DATA_FILE = os.path.join(ROOT, "data.json")
-
 UNIVERSE = {
     "Nifty 50": sorted(set("ADANIENT ADANIPORTS APOLLOHOSP ASIANPAINT AXISBANK BAJAJ-AUTO BAJAJFINSV BAJFINANCE BEL BHARTIARTL CIPLA COALINDIA DRREDDY EICHERMOT ETERNAL GRASIM HCLTECH HDFCBANK HDFCLIFE HEROMOTOCO HINDALCO HINDUNILVR ICICIBANK INDUSINDBK INFY ITC JIOFIN JSWSTEEL KOTAKBANK LT M&M MARUTI NESTLEIND NTPC ONGC POWERGRID RELIANCE SBILIFE SBIN SHRIRAMFIN SUNPHARMA TATACONSUM TATASTEEL TCS TECHM TITAN TRENT ULTRACEMCO WIPRO".split())),
     "Nifty 500": [],
@@ -186,45 +185,11 @@ def normalize_nse_symbol(value):
     return value
 
 
-def calculate_rsi(series, period=14):
-    delta = series.diff()
-    gain = delta.clip(lower=0).fillna(0)
-    loss = (-delta).clip(lower=0).fillna(0)
-    avg_gain = gain.rolling(period, min_periods=period).mean()
-    avg_loss = loss.rolling(period, min_periods=period).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(50)
-
-
-def has_bullish_rsi_divergence(data, bar_index, lookback=25):
-    if bar_index < 2 or bar_index >= len(data):
-        return False
-    start = max(0, bar_index - lookback)
-    frame = data.iloc[start:bar_index + 1].copy()
-    if len(frame) < 5:
-        return False
-    recent_close = frame["Close"].iloc[:-1]
-    recent_rsi = frame["rsi"].iloc[:-1]
-    if recent_close.empty or recent_rsi.empty:
-        return False
-    price_low_idx = recent_close.idxmin()
-    rsi_low_idx = recent_rsi.idxmin()
-    if price_low_idx == rsi_low_idx:
-        return False
-    current_close = float(frame["Close"].iloc[-1])
-    current_rsi = float(frame["rsi"].iloc[-1])
-    low_price = float(frame.loc[price_low_idx, "Close"])
-    low_rsi = float(frame.loc[rsi_low_idx, "rsi"])
-    return current_close > low_price and current_rsi > low_rsi
-
-
 def add_indicators(frame, length, multiplier):
     data = frame.copy()
-    middle = data["Close"].rolling(int(length), min_periods=int(length)).mean()
-    deviation = data["Close"].rolling(int(length), min_periods=int(length)).std(ddof=0) * float(multiplier)
-    data["basis"], data["upper"], data["lower"] = middle, middle + deviation, middle - deviation
-    data["rsi"] = calculate_rsi(data["Close"], 14)
+    basis = data.Close.rolling(int(length), min_periods=int(length)).mean()
+    deviation = data.Close.rolling(int(length), min_periods=int(length)).std(ddof=0) * float(multiplier)
+    data["basis"], data["upper"], data["lower"] = basis, basis + deviation, basis - deviation
     buy = np.zeros(len(data), dtype=bool)
     sell = np.zeros(len(data), dtype=bool)
     green_streak = red_streak = 0
@@ -247,86 +212,74 @@ def add_indicators(frame, length, multiplier):
 
 
 def confirmed_buys(data, valid):
-    """Return confirmed buy entries and stop-loss per entry."""
+    """Confirmed entries; stop is the lower of the candle immediately before entry and entry candle."""
     entries = []
     for signal in np.flatnonzero(data.buy.to_numpy()):
         trigger = float(data.High.iloc[signal])
         for confirmation in range(int(signal) + 1, min(len(data), int(signal) + 1 + int(valid))):
             if data.High.iloc[confirmation] > trigger:
                 price = max(float(data.Open.iloc[confirmation]), trigger)
-                stop_loss = min(float(data.Low.iloc[signal]), float(data.Low.iloc[confirmation]))
+                previous_low = float(data.Low.iloc[confirmation - 1])
+                entry_low = float(data.Low.iloc[confirmation])
+                stop = min(previous_low, entry_low)
                 if price > 0:
-                    entries.append((int(signal), confirmation, price, stop_loss))
+                    entries.append((int(signal), confirmation, price, stop))
                 break
     return entries
 
 
-def exit_on_bar(data, index, average_entry, stop_loss):
-    """Stop-out first. If no stop, exit only at +5% profit or sell signal."""
+def exit_on_bar(data, index, average_entry, stop_loss, target_pct):
+    """Apply stop first, then take-profit exits at the selected return threshold."""
     row = data.iloc[index]
     if stop_loss > 0 and float(row.Low) <= stop_loss:
         return index, min(float(row.Open), float(stop_loss)), "Stop-loss"
-    profit_target = float(average_entry) * 1.05
+    profit_target = float(average_entry) * (1 + float(target_pct) / 100)
     if pd.notna(row.upper) and row.High >= row.upper:
         target_price = max(float(row.Open), float(row.upper))
         if target_price >= profit_target:
-            return index, target_price, "Target (Upper BB, +5%)"
+            return index, target_price, f"Target (Upper BB, +{target_pct:.1f}%)"
     if bool(row.sell) and float(row.Close) >= profit_target:
-        return index, float(row.Close), "Sell signal (+5%)"
+        return index, float(row.Close), f"Sell signal (+{target_pct:.1f}%)"
     return None
 
 
-def find_exit(data, start, average_entry, stop_loss):
+def find_exit(data, start, average_entry, stop_loss, target_pct):
     for i in range(max(0, start), len(data)):
-        result = exit_on_bar(data, i, average_entry, stop_loss)
+        result = exit_on_bar(data, i, average_entry, stop_loss, target_pct)
         if result:
             return result
     return None
 
 
-def pending_buy(data, symbol, lookback, valid, use_rsi_divergence, rsi_lookback, partial_exit_pct):
+def pending_buy(data, symbol, lookback, valid):
     signals = np.flatnonzero(data.buy.to_numpy())
     if not len(signals):
         return None
     signal = int(signals[-1])
     if len(data) - 1 - signal > lookback:
         return None
-    if use_rsi_divergence and not has_bullish_rsi_divergence(data, signal, rsi_lookback):
-        return None
     trigger = float(data.High.iloc[signal])
-    stop = float(data.Low.iloc[signal])
-    confirmed = None
-    status = "⏳ WAITING – buy above trigger"
+    signal_low = float(data.Low.iloc[signal])
+    confirmed, status = None, "⏳ WAITING – buy above trigger"
     for i in range(signal + 1, min(len(data), signal + 1 + valid)):
         if data.High.iloc[i] > trigger:
-            confirmed = i
-            status = "✅ BUY CONFIRMED"
+            confirmed, status = i, "✅ BUY CONFIRMED"
             break
-        if data.Low.iloc[i] < stop:
+        if data.Low.iloc[i] < signal_low:
             status = "❌ Failed (signal low broken)"
             break
     if confirmed is None and status.startswith("⏳") and len(data) - 1 - signal >= valid:
         status = "⌛ Expired"
-    if confirmed is not None:
-        entry = max(float(data.Open.iloc[confirmed]), trigger)
-        stop = min(stop, float(data.Low.iloc[confirmed]))
-        if find_exit(data, confirmed + 1, entry, stop):
-            status = "🏁 Already exited"
-    current_upper = data.upper.iloc[-1]
     entry = max(float(data.Open.iloc[confirmed]), trigger) if confirmed is not None else trigger
-    return {
-        "Symbol": symbol,
-        "Signal Date": data.index[signal].date(),
-        "Buy Above (Trigger)": round(trigger, 2),
-        "Stop-loss": round(stop, 2),
-        "Target (Upper BB)": round(float(current_upper), 2) if pd.notna(current_upper) else None,
-        "LTP": round(float(data.Close.iloc[-1]), 2),
-        "Status": status,
-        "Confirmed On": data.index[confirmed].date() if confirmed is not None else None,
-        "Partial Exit %": partial_exit_pct,
-        "RSI Divergence": "Yes" if use_rsi_divergence else "No",
-        "Reward:Risk": round((current_upper - entry) / (entry - stop), 2) if pd.notna(current_upper) and entry > stop else None,
-    }
+    stop = min(float(data.Low.iloc[confirmed - 1]), float(data.Low.iloc[confirmed])) if confirmed is not None and confirmed > 0 else signal_low
+    if confirmed is not None and find_exit(data, confirmed + 1, entry, stop, 5.0):
+        status = "🏁 Already exited"
+    current_upper = data.upper.iloc[-1]
+    return {"Symbol": symbol, "Signal Date": data.index[signal].date(), "Buy Above (Trigger)": round(trigger, 2),
+            "Entry (if confirmed)": round(entry, 2), "Stop-loss (lower prior/entry low)": round(stop, 2),
+            "Target (Upper BB)": round(float(current_upper), 2) if pd.notna(current_upper) else None,
+            "LTP": round(float(data.Close.iloc[-1]), 2), "Status": status,
+            "Confirmed On": data.index[confirmed].date() if confirmed is not None else None}
 
 
 def read_portfolio():
@@ -343,7 +296,7 @@ def read_portfolio():
                 symbol, shares = str(item["symbol"]), int(item["shares"])
                 price, entry_date = float(item["price"]), date.fromisoformat(str(item["entry_date"]))
                 if symbol and shares > 0 and price > 0:
-                    valid.append({**item, "symbol": symbol, "shares": shares, "price": price, "entry_date": str(entry_date), "sl": float(item.get("sl", 0) or 0)})
+                    valid.append({**item, "symbol": symbol, "shares": shares, "price": price, "entry_date": str(entry_date)})
             except (KeyError, TypeError, ValueError):
                 continue
         return valid
@@ -352,7 +305,6 @@ def read_portfolio():
 
 
 def write_portfolio(holdings):
-    """Atomic replacement prevents partial/corrupt portfolio files."""
     fd, temp_path = tempfile.mkstemp(prefix="portfolio-", suffix=".json", dir=ROOT)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -365,31 +317,39 @@ def write_portfolio(holdings):
             os.remove(temp_path)
 
 
-def evaluate_holding(holding, data, valid):
+def evaluate_holding(holding, data, valid, target_pct):
     if data.empty:
         return None
     entry_index = int(data.index.searchsorted(pd.Timestamp(holding["entry_date"])))
     quantity = int(holding["shares"])
-    invested = float(holding["shares"] * holding["price"])
-    stop_loss = holding.get("sl", 0) or 0
-    if stop_loss == 0 and entry_index < len(data):
-        signal_low = float(data.Low.iloc[max(entry_index - 1, 0)])
+    invested = float(quantity * holding["price"])
+    if holding.get("sl", 0):
+        stop_loss = float(holding["sl"])
+    elif entry_index < len(data):
+        prior_low = float(data.Low.iloc[max(entry_index - 1, 0)])
         entry_low = float(data.Low.iloc[entry_index])
-        stop_loss = min(signal_low, entry_low)
+        stop_loss = min(prior_low, entry_low)
+    else:
+        stop_loss = float(data.Low.iloc[-1])
 
     setups = [setup for setup in confirmed_buys(data, valid) if setup[0] > entry_index and setup[1] > entry_index]
     setup_cursor = 0
     exit_info = None
+    add_on_buys = 0
+    last_add_index = entry_index
+    initial_capital = invested
     for i in range(max(0, entry_index + 1), len(data)):
         while setup_cursor < len(setups) and setups[setup_cursor][1] == i:
             _, _, add_price, add_stop = setups[setup_cursor]
-            add_qty = max(int(capital_for_add_on(holding, add_price)), 1)
+            add_qty = max(int(initial_capital // add_price), 1)
             quantity += add_qty
             invested += add_qty * add_price
             stop_loss = min(stop_loss, add_stop)
+            add_on_buys += 1
+            last_add_index = i
             setup_cursor += 1
         average_entry = invested / quantity
-        exit_info = exit_on_bar(data, i, average_entry, stop_loss)
+        exit_info = exit_on_bar(data, i, average_entry, stop_loss, target_pct)
         if exit_info:
             break
 
@@ -403,122 +363,64 @@ def evaluate_holding(holding, data, valid):
     else:
         status = f"🔴 EXIT DUE – {exit_info[2]} on {data.index[exit_info[0]].date()}"
     upper = data.upper.iloc[-1]
-    return {
-        "Symbol": holding["symbol"],
-        "Shares (incl. modeled adds)": quantity,
-        "Original Entry": round(float(holding["price"]), 2),
-        "Average Entry": round(average_entry, 2),
-        "Stop-loss": round(stop_loss, 2),
-        "Entry Date": holding["entry_date"],
-        "LTP": round(latest, 2),
-        "P&L ₹ (incl. modeled adds)": round(pnl, 2),
-        "P&L %": round((latest / average_entry - 1) * 100, 2),
-        "Target (Upper BB)": round(float(upper), 2) if pd.notna(upper) else None,
-        "Status": status,
-    }
+    return {"Symbol": holding["symbol"], "Shares (including modeled adds)": quantity,
+            "Average Entry": round(average_entry, 2), "Stop-loss": round(stop_loss, 2),
+            "Add-on Buys": add_on_buys, "Last Buy Date": data.index[last_add_index].date(),
+            "Holding Period (bars since last buy)": max(0, len(data) - 1 - last_add_index),
+            "LTP": round(latest, 2), "P&L ₹ (including modeled adds)": round(pnl, 2),
+            "P&L %": round((latest / average_entry - 1) * 100, 2),
+            "Target (Upper BB)": round(float(upper), 2) if pd.notna(upper) else None, "Status": status}
 
 
-def capital_for_add_on(holding, add_price):
-    return max(float(holding["price"]) * int(holding["shares"]), 0.0) / max(float(add_price), 1e-6)
-
-
-def run_backtest(data, symbol, valid, use_stop, capital, use_rsi_divergence=False, rsi_lookback=25, partial_exit_pct=0.5):
-    trades, occupied_until = [], 0
-    for signal in np.flatnonzero(data.buy.to_numpy()):
-        if signal < occupied_until:
-            continue
-        if use_rsi_divergence and not has_bullish_rsi_divergence(data, int(signal), rsi_lookback):
-            continue
-        trigger = float(data.High.iloc[signal])
-        stop = float(data.Low.iloc[signal])
-        confirmation = None
-        for i in range(signal + 1, min(len(data), signal + 1 + valid)):
-            if data.High.iloc[i] > trigger:
-                confirmation = i
-                break
-            if data.Low.iloc[i] < stop:
-                break
-        if confirmation is None:
-            continue
-        entry = max(float(data.Open.iloc[confirmation]), trigger)
-        if entry <= 0:
-            continue
-
+def run_backtest(data, symbol, valid, capital, target_pct):
+    setups = confirmed_buys(data, valid)
+    trades, cursor = [], 0
+    while cursor < len(setups):
+        first_signal, entry_index, entry, stop_loss = setups[cursor]
+        cursor += 1
         quantity = max(int(capital // entry), 1)
-        partial_qty = max(int(quantity * float(partial_exit_pct)), 1) if quantity > 1 and partial_exit_pct > 0 else quantity
-        runner_qty = max(quantity - partial_qty, 0)
-        partial_pnl = 0.0
-        runner_pnl = 0.0
-        partial_exit_index = None
-        partial_exit_price = None
+        invested = quantity * entry
+        add_on_buys = 0
+        exit_info = None
         final_index = len(data) - 1
-        final_price = float(data.Close.iloc[-1])
-        final_reason = "Still open"
-
-        stop = min(stop, float(data.Low.iloc[confirmation]))
-        for i in range(confirmation + 1, len(data)):
-            row = data.iloc[i]
-            if stop > 0 and row.Low <= stop:
+        last_entry_index = entry_index
+        for i in range(entry_index + 1, len(data)):
+            while cursor < len(setups) and setups[cursor][1] == i:
+                signal_index, _, add_price, add_stop = setups[cursor]
+                if signal_index > first_signal:
+                    add_qty = max(int(capital // add_price), 1)
+                    quantity += add_qty
+                    invested += add_qty * add_price
+                    stop_loss = min(stop_loss, add_stop)
+                    add_on_buys += 1
+                    last_entry_index = i
+                cursor += 1
+            average_entry = invested / quantity
+            exit_info = exit_on_bar(data, i, average_entry, stop_loss, target_pct)
+            if exit_info:
                 final_index = i
-                final_price = min(float(row.Open), float(stop))
-                final_reason = "Stop-loss"
                 break
-            if partial_exit_index is None and pd.notna(row.upper) and row.High >= row.upper:
-                partial_exit_index = i
-                partial_exit_price = max(float(row.Open), float(row.upper))
-                partial_pnl = (partial_exit_price - entry) * partial_qty
-                if runner_qty <= 0:
-                    final_index = i
-                    final_price = partial_exit_price
-                    final_reason = "Partial exit (Upper BB)"
-                    break
-                continue
-            if partial_exit_index is not None:
-                if bool(row.sell):
-                    final_index = i
-                    final_price = float(row.Close)
-                    final_reason = "Sell signal"
-                    runner_pnl = (final_price - entry) * runner_qty
-                    break
-                if pd.notna(row.basis) and row.Close < row.basis:
-                    final_index = i
-                    final_price = float(row.Close)
-                    final_reason = "Runner exit (below basis)"
-                    runner_pnl = (final_price - entry) * runner_qty
-                    break
-
-        if partial_exit_index is None:
-            final_index, final_price, final_reason = find_exit(data, confirmation + 1, entry, stop) or (len(data) - 1, float(data.Close.iloc[-1]), "Still open")
-            total_pnl = (final_price - entry) * quantity
+        average_entry = invested / quantity
+        if exit_info:
+            final_index, exit_price, reason = exit_info
         else:
-            if partial_exit_index is not None and runner_qty > 0 and final_reason == "Still open":
-                final_price = float(data.Close.iloc[-1])
-                runner_pnl = (final_price - entry) * runner_qty
-            total_pnl = partial_pnl + runner_pnl
-
-        if partial_exit_index is not None and runner_qty <= 0:
-            final_reason = "Partial exit (Upper BB)"
-
-        trades.append({
-            "Symbol": symbol,
-            "Signal Date": data.index[signal].date(),
-            "Entry Date": data.index[confirmation].date(),
-            "Entry": round(entry, 2),
-            "Exit Date": data.index[final_index].date(),
-            "Exit": round(final_price, 2),
-            "Exit Reason": final_reason,
-            "Qty": quantity,
-            "Partial Qty": partial_qty,
-            "Runner Qty": runner_qty,
-            "Return %": round((final_price / entry - 1) * 100, 2),
-            "P&L ₹": round(total_pnl, 2),
-            "Bars Held": int(final_index - confirmation),
-        })
-        occupied_until = final_index + 1 if (final_reason != "Still open") else len(data)
+            exit_price, reason = float(data.Close.iloc[-1]), "Still open"
+        pnl = exit_price * quantity - invested
+        trades.append({"Symbol": symbol, "Signal Date": data.index[first_signal].date(),
+                       "Entry Date": data.index[entry_index].date(), "Last Buy Date": data.index[last_entry_index].date(),
+                       "Initial Entry": round(entry, 2), "Average Entry": round(average_entry, 2),
+                       "Stop-loss": round(stop_loss, 2), "Add-on Buys": add_on_buys,
+                       "Total Invested ₹": round(invested, 2), "Exit Date": data.index[final_index].date(),
+                       "Exit": round(exit_price, 2), "Exit Reason": reason,
+                       "Return %": round(pnl / invested * 100, 2), "Qty": quantity,
+                       "P&L ₹": round(pnl, 2), "Bars Held": int(final_index - last_entry_index)})
+        if not exit_info:
+            break
+        while cursor < len(setups) and setups[cursor][1] <= final_index:
+            cursor += 1
     return trades
 
 
-# Sidebar controls
 st.sidebar.title("📈 BB Exhaustion Scanner")
 section = st.sidebar.radio("Section", SECTIONS)
 with st.sidebar.expander("⚙️ Strategy settings"):
@@ -528,11 +430,11 @@ with st.sidebar.expander("⚙️ Strategy settings"):
     years = st.slider("History to load (years)", 1, 10, 3)
     lookback = st.slider("Show buy signals from last N candles", 1, 30, 10)
     valid = st.slider("Signal valid for N candles", 1, 15, 5)
-    use_stop = st.checkbox("Use stop-loss if price hits the lower of signal and entry candle lows", value=True)
-    use_rsi_divergence = st.checkbox("Use RSI bullish divergence filter", value=False)
-    rsi_lookback = st.slider("RSI divergence lookback", 10, 60, 25)
-    partial_exit_pct = st.slider("Partial exit at upper BB %", 0.0, 1.0, 0.5, 0.05)
+    stoploss_enabled = st.checkbox("Use stop-loss at lower prior/entry candle low", value=True)
     source = st.selectbox("Data source", ["live", "local"], format_func=lambda value: {"live": "Live (Yahoo / NSE)", "local": "Local data.json only"}[value])
+
+target_choice = st.sidebar.selectbox("Profit target for exits and backtest", ["3.8%", "5%"], index=1)
+target_pct = 3.8 if target_choice == "3.8%" else 5.0
 
 with st.sidebar.expander("➕ Add a bought stock"):
     index_name = st.selectbox("Index", INDEXES, key="holding_index")
@@ -541,7 +443,7 @@ with st.sidebar.expander("➕ Add a bought stock"):
     quantity = st.number_input("No. of shares", 1, 10_000_000, 10)
     price = st.number_input("Buy price ₹", 0.01, 1_000_000.0, 100.0, 0.05)
     buy_date = st.date_input("Buy date", date.today())
-    stop_price = st.number_input("Stop-loss ₹ (0 = automatic)", 0.0, 1_000_000.0, 0.0, 0.05)
+    stop_price = st.number_input("Manual stop-loss ₹ (0 = candle-low rule)", 0.0, 1_000_000.0, 0.0, 0.05)
     if st.button("Save holding", type="primary"):
         holdings = read_portfolio()
         holdings.append({"index": index_name, "symbol": symbol, "shares": int(quantity), "price": float(price), "entry_date": str(buy_date), "sl": float(stop_price)})
@@ -557,7 +459,7 @@ if st.sidebar.button("🔄 Refresh lists from NSE"):
         st.sidebar.warning("Could not refresh: " + ", ".join(failures) + ". Existing lists are kept.")
     else:
         st.sidebar.success("Lists updated")
-st.sidebar.caption("Stop-loss is the lower of the signal low and the entry candle low. Upper-BB exits still require at least 5% profit over average entry before they trigger.")
+st.sidebar.caption("Stops use the lower of the candle immediately before entry and the entry candle. Exit targets are selectable: 3.8% or 5%.")
 
 
 def get_indicators(symbols):
@@ -566,7 +468,7 @@ def get_indicators(symbols):
 
 
 def show_holdings(holdings, prices):
-    rows = [evaluate_holding(item, prices[item["symbol"]], valid) for item in holdings if item["symbol"] in prices]
+    rows = [evaluate_holding(item, prices[item["symbol"]], valid, target_pct) for item in holdings if item["symbol"] in prices]
     missing = sorted({item["symbol"] for item in holdings if item["symbol"] not in prices})
     if missing:
         st.warning("No usable price data for: " + ", ".join(missing))
@@ -575,9 +477,9 @@ def show_holdings(holdings, prices):
         frame = pd.DataFrame(rows)
         urgent = frame["Status"].str.contains("EXIT", na=False)
         if urgent.any():
-            st.error(f"{int(urgent.sum())} holding(s) need attention: {', '.join(frame.loc[urgent, 'Symbol'])}")
+            st.error(f"{int(urgent.sum())} holding(s) have exit alerts: " + ", ".join(frame.loc[urgent, "Symbol"]))
         st.dataframe(frame, use_container_width=True, hide_index=True)
-        st.caption(f"Total P&L: ₹{frame['P&L ₹ (incl. modeled adds)'].sum():,.2f}")
+        st.caption("Modeled add-on buys use the original holding value as capital per add; this estimate does not execute trades or modify your saved holding.")
     elif not missing:
         st.info("No holdings yet. Add one using the sidebar.")
 
@@ -585,24 +487,27 @@ def show_holdings(holdings, prices):
 if section in INDEXES:
     st.title(section)
     symbols = get_symbols(section)
-    with st.spinner(f"Loading market data for {len(symbols)} stocks…"):
-        indicators = get_indicators(symbols)
-    latest = max((frame.index[-1].date() for frame in indicators.values()), default="n/a")
-    st.caption(f"{len(indicators)}/{len(symbols)} stocks loaded • latest candle: {latest}")
-    missing = sorted(set(symbols) - set(indicators))
-    if missing:
-        st.warning("Some stocks did not return enough valid data: " + ", ".join(missing))
-    st.subheader("🟢 Buy signals")
-    rows = [result for name, frame in indicators.items() if (result := pending_buy(frame, name, lookback, valid, use_rsi_divergence, rsi_lookback, partial_exit_pct))]
-    show_all = st.checkbox("Also show failed / expired / exited signals", False, key=f"show_all_{section}")
-    if not show_all:
-        rows = [row for row in rows if row["Status"].startswith(("✅", "⏳"))]
-    if rows:
-        st.dataframe(pd.DataFrame(rows).sort_values(["Status", "Signal Date"], ascending=[False, False]), use_container_width=True, hide_index=True)
+    if not symbols:
+        st.warning(f"Could not load {section} constituents. Check internet or refresh the NSE lists.")
     else:
-        st.info("No matching buy signals in the selected lookback period.")
-    st.subheader("🔴 Exit alerts – your holdings in this index")
-    show_holdings([item for item in read_portfolio() if item.get("index") == section], indicators)
+        with st.spinner(f"Loading market data for {len(symbols)} stocks…"):
+            indicators = get_indicators(symbols)
+        latest = max((frame.index[-1].date() for frame in indicators.values()), default="n/a")
+        st.caption(f"{len(indicators)}/{len(symbols)} stocks loaded • latest candle: {latest}")
+        missing = sorted(set(symbols) - set(indicators))
+        if missing:
+            st.warning("Some stocks did not return enough valid data: " + ", ".join(missing))
+        st.subheader("🟢 Buy signals")
+        rows = [result for name, frame in indicators.items() if (result := pending_buy(frame, name, lookback, valid))]
+        show_all = st.checkbox("Also show failed / expired / exited signals", False, key=f"show_all_{section}")
+        if not show_all:
+            rows = [row for row in rows if row["Status"].startswith(("✅", "⏳"))]
+        if rows:
+            st.dataframe(pd.DataFrame(rows).sort_values(["Status", "Signal Date"], ascending=[False, False]), use_container_width=True, hide_index=True)
+        else:
+            st.info("No matching buy signals in the selected lookback period.")
+        st.subheader("🔴 Exit alerts – your holdings in this index")
+        show_holdings([item for item in read_portfolio() if item.get("index") == section], indicators)
 
 elif section == "My Portfolio":
     st.title("My Portfolio")
@@ -625,7 +530,7 @@ elif section == "My Portfolio":
 
 else:
     st.title("Backtest")
-    st.caption("Choose an index or enter an individual NSE symbol, such as NSE:MCX. Confirmed buys add the same capital to open trades. Stop uses the lower of signal and entry candle lows; profit exits need at least 5% over average entry.")
+    st.caption(f"Custom NSE symbols are supported (e.g. NSE:MCX). Buy signals while a trade is open add the same capital. Stop-loss uses the lower of prior-candle and entry-candle lows; profit target is {target_pct:.1f}%.")
     col1, col2, col3 = st.columns(3)
     choice = col1.selectbox("Stocks", INDEXES + ["All listed indices", "Custom stock"])
     test_years = col2.slider("Years of history", 1, 10, 5)
@@ -643,7 +548,7 @@ else:
             st.error(str(exc))
             symbols = []
         if not symbols:
-            st.warning("No stocks to backtest. Check the symbol or refresh NSE lists.")
+            st.warning("No stocks to backtest. Check the symbol or refresh the NSE lists.")
         else:
             with st.spinner(f"Downloading data for {len(symbols)} stock(s)…"):
                 raw = load_many(tuple(symbols), int(test_years), interval, source)
@@ -654,7 +559,7 @@ else:
             usable = [(name, frame) for name, frame in raw.items() if len(frame) >= bb_length]
             progress = st.progress(0.0)
             for i, (name, frame) in enumerate(usable):
-                trades.extend(run_backtest(add_indicators(frame, bb_length, bb_mult), name, valid, use_stop, capital, use_rsi_divergence, rsi_lookback, partial_exit_pct))
+                trades.extend(run_backtest(add_indicators(frame, bb_length, bb_mult), name, valid, capital, target_pct))
                 progress.progress((i + 1) / max(len(usable), 1))
             if not trades:
                 st.warning("No trades generated. Check data availability and settings.")
@@ -669,7 +574,7 @@ else:
                 metrics[3].metric("Net P&L", f"₹{trade_frame['P&L ₹'].sum():,.0f}")
                 loss_total = abs(losers["P&L ₹"].sum())
                 profit_factor = winners["P&L ₹"].sum() / loss_total if loss_total else float("inf")
-                metrics[4].metric("Profit factor", f"{profit_factor:.2f}")
+                metrics[4].metric(f"Profit factor ({target_pct:.1f}% target)", f"{profit_factor:.2f}")
                 equity = trade_frame.assign(Equity=trade_frame["P&L ₹"].cumsum()).set_index(pd.to_datetime(trade_frame["Exit Date"]))["Equity"]
                 st.subheader("Equity curve (cumulative P&L ₹)")
                 st.line_chart(equity)
