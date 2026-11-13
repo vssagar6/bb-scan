@@ -143,9 +143,8 @@ def load_many(symbols, years, interval, source):
     if not pending:
         return results
     start = date.today() - timedelta(days=365 * int(years))
-    batch_size = 40
-    for offset in range(0, len(pending), batch_size):
-        batch = pending[offset:offset + batch_size]
+    for offset in range(0, len(pending), 40):
+        batch = pending[offset:offset + 40]
         tickers = [f"{symbol}.NS" for symbol in batch]
         try:
             downloaded = yf.download(tickers=tickers, start=start, interval=interval, group_by="ticker", auto_adjust=True, progress=False, threads=True, timeout=20)
@@ -226,7 +225,6 @@ def add_indicators(frame, length, multiplier):
             green_streak += 1
         if red and close < lower:
             red_streak += 1
-        # Lower-band exhaustion buy only when RSI is at most 50.
         buy[i] = green and close > lower and red_streak > 0 and pd.notna(rsi_value) and float(rsi_value) <= 50.0 and float(close) <= MAX_BUY_PRICE
         sell[i] = red and close < upper and green_streak > 0
         if sell[i]:
@@ -237,31 +235,31 @@ def add_indicators(frame, length, multiplier):
     return data
 
 
-def signal_has_valid_rsi(data, signal_index, max_rsi=50.0):
-    if signal_index < 0 or signal_index >= len(data):
-        return False
-    value = data["rsi"].iloc[signal_index]
-    return pd.notna(value) and float(value) <= float(max_rsi) and float(data.Close.iloc[signal_index]) <= MAX_BUY_PRICE
+def signal_is_valid(data, index):
+    return (0 <= index < len(data) and pd.notna(data["rsi"].iloc[index])
+            and float(data["rsi"].iloc[index]) <= 50.0
+            and float(data.Close.iloc[index]) <= MAX_BUY_PRICE)
 
 
 def confirmed_buys(data, valid):
     """Get confirmation-bar entries for all qualifying buy signals."""
     entries = []
     for signal in np.flatnonzero(data.buy.to_numpy()):
-        if not signal_has_valid_rsi(data, int(signal)):
+        signal = int(signal)
+        if not signal_is_valid(data, signal):
             continue
         trigger = float(data.High.iloc[signal])
-        for confirmation in range(int(signal) + 1, min(len(data), int(signal) + 1 + int(valid))):
+        for confirmation in range(signal + 1, min(len(data), signal + 1 + int(valid))):
             if data.High.iloc[confirmation] > trigger:
                 entry = max(float(data.Open.iloc[confirmation]), trigger)
                 if 0 < entry <= MAX_BUY_PRICE:
-                    entries.append((int(signal), confirmation, entry))
+                    entries.append((signal, confirmation, entry))
                 break
     return entries
 
 
 def exit_on_bar(data, index, average_entry, target_pct):
-    """No stop-loss. Exit at the selected profit target on an upper-band or sell signal."""
+    """Exit at target on an upper-band or sell signal."""
     row = data.iloc[index]
     target = float(average_entry) * (1.0 + float(target_pct) / 100.0)
     if pd.notna(row.upper) and row.High >= row.upper:
@@ -282,10 +280,9 @@ def find_exit(data, start, average_entry, target_pct):
 
 
 def pending_buy(data, symbol, lookback, valid, target_pct):
-    # Do not keep an index buy alert once the latest traded price exceeds the cap.
     if data.empty or float(data.Close.iloc[-1]) > MAX_BUY_PRICE:
         return None
-    signals = [int(signal) for signal in np.flatnonzero(data.buy.to_numpy()) if signal_has_valid_rsi(data, int(signal))]
+    signals = [int(s) for s in np.flatnonzero(data.buy.to_numpy()) if signal_is_valid(data, int(s))]
     if not signals:
         return None
     signal = signals[-1]
@@ -295,8 +292,7 @@ def pending_buy(data, symbol, lookback, valid, target_pct):
     confirmed, status = None, "⏳ WAITING – buy above trigger"
     for i in range(signal + 1, min(len(data), signal + 1 + valid)):
         if data.High.iloc[i] > trigger:
-            candidate_entry = max(float(data.Open.iloc[i]), trigger)
-            if candidate_entry <= MAX_BUY_PRICE:
+            if max(float(data.Open.iloc[i]), trigger) <= MAX_BUY_PRICE:
                 confirmed, status = i, "✅ BUY CONFIRMED"
             else:
                 status = "❌ Entry above ₹5,000 cap"
@@ -356,7 +352,7 @@ def evaluate_holding(holding, data, valid, target_pct):
     quantity = int(holding["shares"])
     invested = float(quantity * holding["price"])
     base_capital, initial_entry = invested, float(holding["price"])
-    setups = [setup for setup in confirmed_buys(data, valid) if setup[0] > entry_index and setup[1] > entry_index]
+    setups = [s for s in confirmed_buys(data, valid) if s[0] > entry_index and s[1] > entry_index]
     cursor, add_count, last_entry, exit_info = 0, 0, entry_index, None
     for i in range(max(0, entry_index + 1), len(data)):
         while cursor < len(setups) and setups[cursor][1] == i:
@@ -432,8 +428,8 @@ with st.sidebar.expander("⚙️ Strategy settings"):
     use_stop = st.checkbox("Use stop-loss", value=False, help="Optional. If enabled, the stop is the low of the buy-signal candle.")
     source = st.selectbox("Data source", ["live", "local"], format_func=lambda value: {"live": "Live (Yahoo / NSE)", "local": "Local data.json only"}[value])
 
-target_choice = st.sidebar.selectbox("Profit target", ["3.8%", "5%"], index=1)
-target_pct = 3.8 if target_choice == "3.8%" else 5.0
+target_choice = st.sidebar.selectbox("Profit target", ["3.8%", "5%", "10%"], index=1)
+target_pct = {"3.8%": 3.8, "5%": 5.0, "10%": 10.0}[target_choice]
 
 with st.sidebar.expander("➕ Add a bought stock"):
     index_name = st.selectbox("Index", INDEXES, key="holding_index")
