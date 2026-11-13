@@ -235,7 +235,9 @@ def add_indicators(frame, length, multiplier):
         if red and close < lower:
             red_streak += 1
         sell[i] = red and close < upper and green_streak > 0
-        buy[i] = green and close > lower and red_streak > 0 and pd.notna(rsi_value) and float(rsi_value) < 40.0
+        buy[i] = (
+            green and close > lower and red_streak > 0 and pd.notna(rsi_value) and float(rsi_value) <= 50.0
+        )
         if sell[i]:
             green_streak = 0
         if buy[i]:
@@ -244,11 +246,11 @@ def add_indicators(frame, length, multiplier):
     return data
 
 
-def signal_has_valid_rsi(data, signal_index, max_rsi=40.0):
+def signal_has_valid_rsi(data, signal_index, max_rsi=50.0):
     if signal_index < 0 or signal_index >= len(data):
         return False
     value = data["rsi"].iloc[signal_index]
-    return pd.notna(value) and float(value) < float(max_rsi)
+    return pd.notna(value) and float(value) <= float(max_rsi)
 
 
 def confirmed_buys(data, valid):
