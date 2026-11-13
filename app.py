@@ -16,10 +16,9 @@ st.set_page_config(page_title="BB Exhaustion Scanner", page_icon="📈", layout=
 ROOT = os.path.dirname(os.path.abspath(__file__))
 PORTFOLIO_FILE = os.path.join(ROOT, "portfolio.json")
 DATA_FILE = os.path.join(ROOT, "data.json")
-# Keep a fallback universe for when the index-constituent CSV cannot be reached.
-# These are Yahoo Finance's current NSE ticker symbols (Nov 2026).
+MAX_BUY_PRICE = 5000.0
 UNIVERSE = {
-    "Nifty 50": sorted(set("ADANIENT ADANIPORTS APOLLOHOSP ASIANPAINT AXISBANK BAJAJ-AUTO BAJAJFINSV BAJFINANCE BEL BHARTIARTL CIPLA COALINDIA DRREDDY EICHERMOT ETERNAL GRASIM HCLTECH HDFCBANK HINDUNILVR ICICIBANK INDUSINDBK INFY ITC JSWSTEEL KOTAKBANK LT M&M MARUTI NTPC ONGC POWERGRID RELIANCE SBIN SUNPHARMA TCS TATACONSUM TATAMOTORS TATASTEEL TECHM TITAN ULTRACEMCO WIPRO NESTLEIND TMPV".split())),
+    "Nifty 50": sorted(set("ADANIENT ADANIPORTS APOLLOHOSP ASIANPAINT AXISBANK BAJAJ-AUTO BAJAJFINSV BAJFINANCE BEL BHARTIARTL CIPLA COALINDIA DRREDDY EICHERMOT ETERNAL GRASIM HCLTECH HDFCBANK HINDUNILVR ICICIBANK INDUSINDBK INFY ITC JSWSTEEL KOTAKBANK LT M&M MARUTI NTPC ONGC POWERGRID RELIANCE SBIN SUNPHARMA TCS TATACONSUM TATASTEEL TECHM TITAN ULTRACEMCO WIPRO NESTLEIND TMPV".split())),
     "Nifty 500": [],
     "Nifty Midcap 150": [],
 }
@@ -30,7 +29,6 @@ NSE_URLS = {
     "Nifty 500": "https://niftyindices.com/IndexConstituent/ind_nifty500list.csv",
     "Nifty Midcap 150": "https://niftyindices.com/IndexConstituent/ind_niftymidcap150list.csv",
 }
-# Translate legacy/wrong symbols saved in session state or portfolio inputs.
 SYMBOL_ALIASES = {"HDFINSERV": "HDFCBANK", "NESTLE": "NESTLEIND", "TATAMOTORS": "TMPV"}
 
 
@@ -50,7 +48,6 @@ def get_symbols(name):
     cached = st.session_state.get("lists", {})
     if name in cached:
         return [SYMBOL_ALIASES.get(str(symbol).upper(), str(symbol).upper()) for symbol in cached[name]]
-    # Prefer the live constituent list so additions/removals don't leave stale symbols.
     symbols = fetch_index_symbols(name) or UNIVERSE.get(name, [])
     if symbols:
         st.session_state.setdefault("lists", {})[name] = symbols
@@ -145,7 +142,6 @@ def load_many(symbols, years, interval, source):
             pending.append(symbol)
     if not pending:
         return results
-
     start = date.today() - timedelta(days=365 * int(years))
     batch_size = 40
     for offset in range(0, len(pending), batch_size):
@@ -162,9 +158,6 @@ def load_many(symbols, years, interval, source):
                 results[symbol] = frame
             else:
                 failed.append((symbol, ticker))
-
-        # A failed ticker in a multi-symbol yfinance response may be isolated;
-        # retry it alone so one bad quote doesn't hide other symbols' data.
         for symbol, ticker in failed:
             try:
                 retry = yf.download(tickers=ticker, start=start, interval=interval, auto_adjust=True, progress=False, threads=False, timeout=20)
@@ -174,7 +167,6 @@ def load_many(symbols, years, interval, source):
                     continue
             except Exception:
                 pass
-            # Use NSE as the final fallback for an individual unavailable Yahoo quote.
             try:
                 from jugaad_data.nse import stock_df
                 fallback = stock_df(symbol=symbol, from_date=start, to_date=date.today(), series="EQ")
@@ -234,10 +226,9 @@ def add_indicators(frame, length, multiplier):
             green_streak += 1
         if red and close < lower:
             red_streak += 1
+        # Lower-band exhaustion buy only when RSI is at most 50.
+        buy[i] = green and close > lower and red_streak > 0 and pd.notna(rsi_value) and float(rsi_value) <= 50.0 and float(close) <= MAX_BUY_PRICE
         sell[i] = red and close < upper and green_streak > 0
-        buy[i] = (
-            green and close > lower and red_streak > 0 and pd.notna(rsi_value) and float(rsi_value) <= 50.0
-        )
         if sell[i]:
             green_streak = 0
         if buy[i]:
@@ -250,7 +241,7 @@ def signal_has_valid_rsi(data, signal_index, max_rsi=50.0):
     if signal_index < 0 or signal_index >= len(data):
         return False
     value = data["rsi"].iloc[signal_index]
-    return pd.notna(value) and float(value) <= float(max_rsi)
+    return pd.notna(value) and float(value) <= float(max_rsi) and float(data.Close.iloc[signal_index]) <= MAX_BUY_PRICE
 
 
 def confirmed_buys(data, valid):
@@ -263,7 +254,7 @@ def confirmed_buys(data, valid):
         for confirmation in range(int(signal) + 1, min(len(data), int(signal) + 1 + int(valid))):
             if data.High.iloc[confirmation] > trigger:
                 entry = max(float(data.Open.iloc[confirmation]), trigger)
-                if entry > 0:
+                if 0 < entry <= MAX_BUY_PRICE:
                     entries.append((int(signal), confirmation, entry))
                 break
     return entries
@@ -291,6 +282,9 @@ def find_exit(data, start, average_entry, target_pct):
 
 
 def pending_buy(data, symbol, lookback, valid, target_pct):
+    # Do not keep an index buy alert once the latest traded price exceeds the cap.
+    if data.empty or float(data.Close.iloc[-1]) > MAX_BUY_PRICE:
+        return None
     signals = [int(signal) for signal in np.flatnonzero(data.buy.to_numpy()) if signal_has_valid_rsi(data, int(signal))]
     if not signals:
         return None
@@ -301,7 +295,11 @@ def pending_buy(data, symbol, lookback, valid, target_pct):
     confirmed, status = None, "⏳ WAITING – buy above trigger"
     for i in range(signal + 1, min(len(data), signal + 1 + valid)):
         if data.High.iloc[i] > trigger:
-            confirmed, status = i, "✅ BUY CONFIRMED"
+            candidate_entry = max(float(data.Open.iloc[i]), trigger)
+            if candidate_entry <= MAX_BUY_PRICE:
+                confirmed, status = i, "✅ BUY CONFIRMED"
+            else:
+                status = "❌ Entry above ₹5,000 cap"
             break
         if data.Low.iloc[i] < float(data.Low.iloc[signal]):
             status = "❌ Failed (signal low broken)"
@@ -459,7 +457,7 @@ if st.sidebar.button("🔄 Refresh lists from NSE"):
         st.sidebar.warning("Could not refresh: " + ", ".join(failures) + ". Existing lists are kept.")
     else:
         st.sidebar.success("Lists updated")
-st.sidebar.caption("Stop-loss is optional and disabled by default. Choose a 3.8% or 5% profit target. No brokerage or slippage included.")
+st.sidebar.caption("Buy alerts require daily RSI ≤ 50 and prices at or below ₹5,000. No brokerage or slippage included.")
 
 
 def get_indicators(symbols):
@@ -496,7 +494,7 @@ if section in INDEXES:
         st.caption(f"{len(indicators)}/{len(symbols)} stocks loaded • latest candle: {latest}")
         missing = sorted(set(symbols) - set(indicators))
         if missing:
-            st.warning("Some stocks did not return enough valid data: " + ", ".join(missing))
+            st.warning("Some symbols did not return enough valid data: " + ", ".join(missing))
         st.subheader("🟢 Buy signals")
         rows = [result for name, frame in indicators.items() if (result := pending_buy(frame, name, lookback, valid, target_pct))]
         show_all = st.checkbox("Also show failed / expired / exited signals", False, key=f"show_all_{section}")
