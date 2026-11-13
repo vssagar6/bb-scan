@@ -16,8 +16,10 @@ st.set_page_config(page_title="BB Exhaustion Scanner", page_icon="📈", layout=
 ROOT = os.path.dirname(os.path.abspath(__file__))
 PORTFOLIO_FILE = os.path.join(ROOT, "portfolio.json")
 DATA_FILE = os.path.join(ROOT, "data.json")
+# Keep a fallback universe for when the index-constituent CSV cannot be reached.
+# These are Yahoo Finance's current NSE ticker symbols (Nov 2026).
 UNIVERSE = {
-    "Nifty 50": sorted(set("ADANIENT ADANIPORTS APOLLOHOSP ASIANPAINT AXISBANK BAJAJ-AUTO BAJAJFINSV BAJFINANCE BEL BHARTIARTL CIPLA COALINDIA DRREDDY EICHERMOT ETERNAL GRASIM HCLTECH HDFCBANK HDFINSERV HINDUNILVR ICICIBANK INDUSINDBK INFY ITC JSWSTEEL KOTAKBANK LT M&M MARUTI NTPC OIL NESTLE POWERGRID RELIANCE SBIN SUNPHARMA TCS TATACONSUM TATAMOTORS TATASTEEL TECHM TITAN ULTRACEMCO WIPRO".split())),
+    "Nifty 50": sorted(set("ADANIENT ADANIPORTS APOLLOHOSP ASIANPAINT AXISBANK BAJAJ-AUTO BAJAJFINSV BAJFINANCE BEL BHARTIARTL CIPLA COALINDIA DRREDDY EICHERMOT ETERNAL GRASIM HCLTECH HDFCBANK HINDUNILVR ICICIBANK INDUSINDBK INFY ITC JSWSTEEL KOTAKBANK LT M&M MARUTI NTPC ONGC POWERGRID RELIANCE SBIN SUNPHARMA TCS TATACONSUM TATAMOTORS TATASTEEL TECHM TITAN ULTRACEMCO WIPRO NESTLEIND TMPV".split())),
     "Nifty 500": [],
     "Nifty Midcap 150": [],
 }
@@ -28,6 +30,8 @@ NSE_URLS = {
     "Nifty 500": "https://niftyindices.com/IndexConstituent/ind_nifty500list.csv",
     "Nifty Midcap 150": "https://niftyindices.com/IndexConstituent/ind_niftymidcap150list.csv",
 }
+# Translate legacy/wrong symbols saved in session state or portfolio inputs.
+SYMBOL_ALIASES = {"HDFINSERV": "HDFCBANK", "NESTLE": "NESTLEIND", "TATAMOTORS": "TMPV"}
 
 
 def fetch_index_symbols(name):
@@ -37,7 +41,7 @@ def fetch_index_symbols(name):
         frame = pd.read_csv(StringIO(response.text))
         if "Symbol" not in frame:
             return []
-        return sorted(set(frame["Symbol"].dropna().astype(str).str.strip().str.upper()))
+        return sorted({SYMBOL_ALIASES.get(s, s) for s in frame["Symbol"].dropna().astype(str).str.strip().str.upper()})
     except (requests.RequestException, ValueError, pd.errors.ParserError):
         return []
 
@@ -45,8 +49,9 @@ def fetch_index_symbols(name):
 def get_symbols(name):
     cached = st.session_state.get("lists", {})
     if name in cached:
-        return cached[name]
-    symbols = UNIVERSE.get(name, []) or fetch_index_symbols(name)
+        return [SYMBOL_ALIASES.get(str(symbol).upper(), str(symbol).upper()) for symbol in cached[name]]
+    # Prefer the live constituent list so additions/removals don't leave stale symbols.
+    symbols = fetch_index_symbols(name) or UNIVERSE.get(name, [])
     if symbols:
         st.session_state.setdefault("lists", {})[name] = symbols
     return symbols
@@ -129,8 +134,8 @@ def _ticker_frame(downloaded, ticker, single_ticker):
 
 @st.cache_data(ttl=900, show_spinner=False)
 def load_many(symbols, years, interval, source):
-    """Load in modest Yahoo batches to avoid oversized Nifty 500 requests."""
-    symbols = tuple(dict.fromkeys(symbols))
+    """Load prices in batches and retry individual Yahoo failures before skipping."""
+    symbols = tuple(dict.fromkeys(SYMBOL_ALIASES.get(str(s).upper(), str(s).upper()) for s in symbols))
     results, pending = {}, []
     for symbol in symbols:
         local = local_prices(symbol, years, interval) if source == "local" else None
@@ -147,32 +152,43 @@ def load_many(symbols, years, interval, source):
         batch = pending[offset:offset + batch_size]
         tickers = [f"{symbol}.NS" for symbol in batch]
         try:
-            downloaded = yf.download(
-                tickers=tickers, start=start, interval=interval, group_by="ticker",
-                auto_adjust=True, progress=False, threads=True, timeout=20,
-            )
+            downloaded = yf.download(tickers=tickers, start=start, interval=interval, group_by="ticker", auto_adjust=True, progress=False, threads=True, timeout=20)
         except Exception:
             downloaded = pd.DataFrame()
+        failed = []
         for symbol, ticker in zip(batch, tickers):
             frame = _ticker_frame(downloaded, ticker, len(batch) == 1)
             if frame is not None and len(frame) >= 30:
                 results[symbol] = frame
-            elif len(pending) == 1:
-                try:
-                    from jugaad_data.nse import stock_df
+            else:
+                failed.append((symbol, ticker))
 
-                    fallback = stock_df(symbol=symbol, from_date=start, to_date=date.today(), series="EQ")
-                    if fallback is not None and not fallback.empty:
-                        fallback = fallback.rename(columns={"DATE": "Date", "OPEN": "Open", "HIGH": "High", "LOW": "Low", "CLOSE": "Close"})
-                        if "Date" in fallback.columns:
-                            fallback = fallback.set_index("Date")
-                        frame = clean_prices(fallback)
-                        if frame is not None and interval == "1wk":
-                            frame = clean_prices(frame.resample("W").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last"}).dropna())
-                        if frame is not None and len(frame) >= 30:
-                            results[symbol] = frame
-                except Exception:
-                    pass
+        # A failed ticker in a multi-symbol yfinance response may be isolated;
+        # retry it alone so one bad quote doesn't hide other symbols' data.
+        for symbol, ticker in failed:
+            try:
+                retry = yf.download(tickers=ticker, start=start, interval=interval, auto_adjust=True, progress=False, threads=False, timeout=20)
+                frame = _ticker_frame(retry, ticker, True)
+                if frame is not None and len(frame) >= 30:
+                    results[symbol] = frame
+                    continue
+            except Exception:
+                pass
+            # Use NSE as the final fallback for an individual unavailable Yahoo quote.
+            try:
+                from jugaad_data.nse import stock_df
+                fallback = stock_df(symbol=symbol, from_date=start, to_date=date.today(), series="EQ")
+                if fallback is not None and not fallback.empty:
+                    fallback = fallback.rename(columns={"DATE": "Date", "OPEN": "Open", "HIGH": "High", "LOW": "Low", "CLOSE": "Close"})
+                    if "Date" in fallback.columns:
+                        fallback = fallback.set_index("Date")
+                    frame = clean_prices(fallback)
+                    if frame is not None and interval == "1wk":
+                        frame = clean_prices(frame.resample("W").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last"}).dropna())
+                    if frame is not None and len(frame) >= 30:
+                        results[symbol] = frame
+            except Exception:
+                pass
     return results
 
 
@@ -184,6 +200,7 @@ def normalize_nse_symbol(value):
             raise ValueError("Only NSE symbols are supported (for example, NSE:MCX).")
     if value.endswith(".NS"):
         value = value[:-3]
+    value = SYMBOL_ALIASES.get(value, value)
     if not re.fullmatch(r"[A-Z0-9&.-]+", value):
         raise ValueError("Enter an NSE ticker such as NSE:MCX or RELIANCE.")
     return value
@@ -198,8 +215,7 @@ def compute_rsi(series, period=14):
     avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(50.0)
+    return (100 - (100 / (1 + rs))).fillna(50.0)
 
 
 def add_indicators(frame, length, multiplier):
@@ -208,8 +224,7 @@ def add_indicators(frame, length, multiplier):
     deviation = data.Close.rolling(int(length), min_periods=int(length)).std(ddof=0) * float(multiplier)
     data["basis"], data["upper"], data["lower"] = middle, middle + deviation, middle - deviation
     data["rsi"] = compute_rsi(data["Close"], 14)
-    buy = np.zeros(len(data), dtype=bool)
-    sell = np.zeros(len(data), dtype=bool)
+    buy, sell = np.zeros(len(data), dtype=bool), np.zeros(len(data), dtype=bool)
     green_streak = red_streak = 0
     for i, (close, open_, upper, lower, rsi_value) in enumerate(zip(data.Close, data.Open, data.upper, data.lower, data.rsi)):
         if pd.isna(upper) or pd.isna(lower):
@@ -220,13 +235,7 @@ def add_indicators(frame, length, multiplier):
         if red and close < lower:
             red_streak += 1
         sell[i] = red and close < upper and green_streak > 0
-        buy[i] = (
-            green
-            and close > lower
-            and red_streak > 0
-            and pd.notna(rsi_value)
-            and float(rsi_value) < 40.0
-        )
+        buy[i] = green and close > lower and red_streak > 0 and pd.notna(rsi_value) and float(rsi_value) < 40.0
         if sell[i]:
             green_streak = 0
         if buy[i]:
@@ -280,11 +289,7 @@ def find_exit(data, start, average_entry, target_pct):
 
 
 def pending_buy(data, symbol, lookback, valid, target_pct):
-    signals = [
-        int(signal)
-        for signal in np.flatnonzero(data.buy.to_numpy())
-        if signal_has_valid_rsi(data, int(signal))
-    ]
+    signals = [int(signal) for signal in np.flatnonzero(data.buy.to_numpy()) if signal_has_valid_rsi(data, int(signal))]
     if not signals:
         return None
     signal = signals[-1]
@@ -305,18 +310,7 @@ def pending_buy(data, symbol, lookback, valid, target_pct):
     if confirmed is not None and find_exit(data, confirmed + 1, entry, target_pct):
         status = "🏁 Already exited"
     upper = data.upper.iloc[-1]
-    return {
-        "Symbol": symbol,
-        "Signal Date": data.index[signal].date(),
-        "RSI": round(float(data["rsi"].iloc[signal]), 2),
-        "Buy Above (Trigger)": round(trigger, 2),
-        "Entry (if confirmed)": round(entry, 2),
-        "Profit Target %": target_pct,
-        "Target (Upper BB)": round(float(upper), 2) if pd.notna(upper) else None,
-        "LTP": round(float(data.Close.iloc[-1]), 2),
-        "Status": status,
-        "Confirmed On": data.index[confirmed].date() if confirmed is not None else None,
-    }
+    return {"Symbol": symbol, "Signal Date": data.index[signal].date(), "RSI": round(float(data.rsi.iloc[signal]), 2), "Buy Above (Trigger)": round(trigger, 2), "Entry (if confirmed)": round(entry, 2), "Profit Target %": target_pct, "Target (Upper BB)": round(float(upper), 2) if pd.notna(upper) else None, "LTP": round(float(data.Close.iloc[-1]), 2), "Status": status, "Confirmed On": data.index[confirmed].date() if confirmed is not None else None}
 
 
 def read_portfolio():
@@ -333,7 +327,7 @@ def read_portfolio():
                 symbol, shares = str(item["symbol"]), int(item["shares"])
                 price, entry_date = float(item["price"]), date.fromisoformat(str(item["entry_date"]))
                 if symbol and shares > 0 and price > 0:
-                    valid.append({**item, "symbol": symbol, "shares": shares, "price": price, "entry_date": str(entry_date)})
+                    valid.append({**item, "symbol": SYMBOL_ALIASES.get(symbol.upper(), symbol.upper()), "shares": shares, "price": price, "entry_date": str(entry_date)})
             except (KeyError, TypeError, ValueError):
                 continue
         return valid
@@ -361,13 +355,9 @@ def evaluate_holding(holding, data, valid, target_pct):
     entry_index = int(data.index.searchsorted(pd.Timestamp(holding["entry_date"])))
     quantity = int(holding["shares"])
     invested = float(quantity * holding["price"])
-    base_capital = invested
-    initial_entry = float(holding["price"])
+    base_capital, initial_entry = invested, float(holding["price"])
     setups = [setup for setup in confirmed_buys(data, valid) if setup[0] > entry_index and setup[1] > entry_index]
-    cursor = 0
-    add_count = 0
-    last_entry = entry_index
-    exit_info = None
+    cursor, add_count, last_entry, exit_info = 0, 0, entry_index, None
     for i in range(max(0, entry_index + 1), len(data)):
         while cursor < len(setups) and setups[cursor][1] == i:
             _, _, add_price = setups[cursor]
@@ -390,39 +380,18 @@ def evaluate_holding(holding, data, valid, target_pct):
     else:
         status = f"🔴 EXIT DUE – {exit_info[2]} on {data.index[exit_info[0]].date()}"
     upper = data.upper.iloc[-1]
-    return {
-        "Symbol": holding["symbol"],
-        "Initial Entry": round(initial_entry, 2),
-        "Average Entry": round(average_entry, 2),
-        "Add-on Buys": add_count,
-        "Shares (modeled adds included)": quantity,
-        "Entry Date": holding["entry_date"],
-        "Last Buy Date": data.index[last_entry].date(),
-        "Holding Period (bars since last buy)": max(0, len(data) - 1 - last_entry),
-        "LTP": round(last_price, 2),
-        "P&L ₹ (modeled adds included)": round(pnl, 2),
-        "P&L %": round((last_price / average_entry - 1) * 100, 2),
-        "Profit Target %": target_pct,
-        "Target (Upper BB)": round(float(upper), 2) if pd.notna(upper) else None,
-        "Status": status,
-    }
+    return {"Symbol": holding["symbol"], "Initial Entry": round(initial_entry, 2), "Average Entry": round(average_entry, 2), "Add-on Buys": add_count, "Shares (modeled adds included)": quantity, "Entry Date": holding["entry_date"], "Last Buy Date": data.index[last_entry].date(), "Holding Period (bars since last buy)": max(0, len(data) - 1 - last_entry), "LTP": round(last_price, 2), "P&L ₹ (modeled adds included)": round(pnl, 2), "P&L %": round((last_price / average_entry - 1) * 100, 2), "Profit Target %": target_pct, "Target (Upper BB)": round(float(upper), 2) if pd.notna(upper) else None, "Status": status}
 
 
 def run_backtest(data, symbol, valid, capital, target_pct):
     """Run sequential trades; allow fresh entries after each completed trade exits."""
-    setups = confirmed_buys(data, valid)
-    trades = []
-    cursor = 0
+    setups, trades, cursor = confirmed_buys(data, valid), [], 0
     while cursor < len(setups):
         first_signal, entry_index, entry_price = setups[cursor]
         cursor += 1
         quantity = max(int(capital // entry_price), 1)
-        invested = quantity * entry_price
-        add_count = 0
-        last_entry_index = entry_index
-        exit_info = None
-        final_index = len(data) - 1
-
+        invested, add_count, last_entry_index = quantity * entry_price, 0, entry_index
+        exit_info, final_index = None, len(data) - 1
         for i in range(entry_index + 1, len(data)):
             while cursor < len(setups) and setups[cursor][1] == i:
                 signal_index, _, add_price = setups[cursor]
@@ -437,31 +406,13 @@ def run_backtest(data, symbol, valid, capital, target_pct):
             if exit_info:
                 final_index = i
                 break
-
         if exit_info:
             final_index, exit_price, reason = exit_info
         else:
             exit_price, reason = float(data.Close.iloc[-1]), "Still open"
         average_entry = invested / quantity
         pnl = exit_price * quantity - invested
-        trades.append({
-            "Symbol": symbol,
-            "Signal Date": data.index[first_signal].date(),
-            "Entry Date": data.index[entry_index].date(),
-            "Last Buy Date": data.index[last_entry_index].date(),
-            "Initial Entry": round(entry_price, 2),
-            "Average Entry": round(average_entry, 2),
-            "Add-on Buys": add_count,
-            "Total Invested ₹": round(invested, 2),
-            "Exit Date": data.index[final_index].date(),
-            "Exit": round(exit_price, 2),
-            "Exit Reason": reason,
-            "Profit Target %": target_pct,
-            "Return %": round(pnl / invested * 100, 2),
-            "Qty": quantity,
-            "P&L ₹": round(pnl, 2),
-            "Bars Held": int(final_index - last_entry_index),
-        })
+        trades.append({"Symbol": symbol, "Signal Date": data.index[first_signal].date(), "Entry Date": data.index[entry_index].date(), "Last Buy Date": data.index[last_entry_index].date(), "Initial Entry": round(entry_price, 2), "Average Entry": round(average_entry, 2), "Add-on Buys": add_count, "Total Invested ₹": round(invested, 2), "Exit Date": data.index[final_index].date(), "Exit": round(exit_price, 2), "Exit Reason": reason, "Profit Target %": target_pct, "Return %": round(pnl / invested * 100, 2), "Qty": quantity, "P&L ₹": round(pnl, 2), "Bars Held": int(final_index - last_entry_index)})
         if not exit_info:
             break
         while cursor < len(setups) and setups[cursor][1] <= final_index:
@@ -481,7 +432,6 @@ with st.sidebar.expander("⚙️ Strategy settings"):
     use_stop = st.checkbox("Use stop-loss", value=False, help="Optional. If enabled, the stop is the low of the buy-signal candle.")
     source = st.selectbox("Data source", ["live", "local"], format_func=lambda value: {"live": "Live (Yahoo / NSE)", "local": "Local data.json only"}[value])
 
-
 target_choice = st.sidebar.selectbox("Profit target", ["3.8%", "5%"], index=1)
 target_pct = 3.8 if target_choice == "3.8%" else 5.0
 
@@ -494,7 +444,7 @@ with st.sidebar.expander("➕ Add a bought stock"):
     buy_date = st.date_input("Buy date", date.today())
     if st.button("Save holding", type="primary"):
         holdings = read_portfolio()
-        holdings.append({"index": index_name, "symbol": symbol, "shares": int(quantity), "price": float(price), "entry_date": str(buy_date)})
+        holdings.append({"index": index_name, "symbol": normalize_nse_symbol(symbol), "shares": int(quantity), "price": float(price), "entry_date": str(buy_date)})
         try:
             write_portfolio(holdings)
             st.success(f"Saved {symbol}")
